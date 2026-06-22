@@ -37,15 +37,25 @@ paperreader --case-sensitive "Query"       # Case-sensitive
 
 `--index` prints page/word stats and warns on unindexable pages. `--no-index` prints a time estimate before searching. Zero-result searches include index diagnostics to distinguish "index failed" from "term absent".
 
+## Table of contents
+
+```bash
+paperreader --file "paper.pdf" --toc        # Extract TOC (PDF outlines first, fallback to heuristics)
+paperreader --file "paper.pdf" --toc --json # Structured JSON with page numbers and hierarchy
+```
+
+Extraction priority: (1) PDF embedded outlines — the same tree PDF readers use for the sidebar, fast and zero false positives; (2) heuristic detection from printed TOC pages. When the document is indexed, all pages are scanned via disk cache (~0.1s); otherwise samples ~25 pages.
+
+JSON output includes hierarchy levels: `0` = part/title, `1` = chapter, `2` = section, `3` = subsection.
+
 ## List & inspect
 
 ```bash
 paperreader --list --json              # Catalog with pages, size, indexed_pages, indexed_words
-paperreader --file "paper.pdf" --toc   # Extract TOC with page numbers and hierarchy levels
 paperreader --file "paper.pdf" --check # CJK character coverage check (samples 3 pages)
 ```
 
-`--list` shows per-document index quality (`indexed_pages`/`indexed_words`) when available. `--toc --json` returns structured entries with page numbers and hierarchy levels (0=part, 1=chapter, 2=section, 3=subsection). `--check` samples 3 pages and reports CJK character ratio.
+`--list` shows per-document index quality (`indexed_pages`/`indexed_words`) when available. `--check` samples 3 pages and reports CJK character ratio.
 
 ## JSON output
 
