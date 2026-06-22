@@ -1,11 +1,11 @@
 ---
 name: paperreader
-description: Index, search, extract pages, and detect TOC in PDF/EPUB papers with paperreader. Use when searching papers, extracting pdf pages, scanning chapter headings, or listing the paper library.
+description: Index, search, extract pages, and detect TOC in PDF papers with paperreader. Use when searching papers, extracting pdf pages, scanning chapter headings, or listing the paper library.
 ---
 
 # Paperreader
 
-Search, catalog, and read local papers (PDF), books (EPUB), and notes (TXT). Structured JSON output with page/chapter divisions. Native CJK text extraction.
+Search, catalog, and read local papers (PDF) and notes (TXT). Structured JSON output with page/chapter divisions. Native CJK text extraction.
 
 ## Deep reading
 

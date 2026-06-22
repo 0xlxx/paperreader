@@ -6,9 +6,9 @@ This document records how the paperreader skills were generated and how to keep 
 
 **Generated from source at:**
 
-- **Commit SHA**: `2dca0244aeb0dd5e6d7f0b6d01eb4973ef614e25`
-- **Date**: `2026-06-22`
-- **Commit**: `fix: index link broken, --toc quality overhaul`
+- **Commit SHA**: `97834d295ade0c8faa07ea3ee20af359a51db46c`
+- **Date**: `2026-06-23`
+- **Commit**: `perf: PDF-level parallelism for --no-index search`
 
 **Source documentation:**
 
@@ -16,7 +16,7 @@ This document records how the paperreader skills were generated and how to keep 
 - CLI help: `paperreader --help` (generated from `src/cli.rs` doc comments)
 - CLAUDE.md: not present at project root
 
-**Generation date**: `2026-06-22`
+**Generation date**: `2026-06-23`
 
 ## Structure
 
@@ -95,9 +95,10 @@ git diff --name-status <last-sha>..HEAD -- src/
 
 | Date       | SHA      | Changes |
 | ---------- | -------- | ------- |
+| 2026-06-23 | `97834d2` | EPUB support removed (3 fewer deps, -457 lines). TOC: index cache (638x speedup), right-aligned detection, numbering-based hierarchy. PDF-level parallelism for --no-index (1.7x). |
 | 2026-06-22 | `2dca024` | Initial generation. TOC two-phase detection, index link fix, natural hierarchy levels, code-snippet filter. |
 
 ---
 
-Last updated: 2026-06-22
-Current SHA: 2dca024
+Last updated: 2026-06-23
+Current SHA: 97834d2
