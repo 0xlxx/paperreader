@@ -28,22 +28,35 @@ pub fn detect_toc(path: &Path, is_epub: bool, total_pages: usize) -> Vec<TocEntr
     let scan_pages = total_pages.min(15);
 
     for page_num in 1..=scan_pages {
-        let text = extract_text(path, is_epub, page_num);
-        let page_entries = extract_dot_leaders(&text, page_num);
+        let page_entries = extract_dot_leaders(&extract_text(path, is_epub, page_num), total_pages);
         entries.extend(page_entries);
+        // Early exit once we have enough entries
+        if entries.len() >= 10 {
+            break;
+        }
     }
 
-    // If we found a real TOC (≥3 dot-leader entries), those are authoritative.
-    // Otherwise, fall through to heading scan.
     let has_toc = entries.len() >= 3;
 
-    // Phase 2: Heading scan across ALL pages
-    let mut heading_entries: Vec<TocEntry> = Vec::new();
-    for page_num in 1..=total_pages {
-        let text = extract_text(path, is_epub, page_num);
-        let page_headings = extract_headings(&text, page_num);
-        heading_entries.extend(page_headings);
+    // Phase 2: Heading scan. Always do a sampling pass across the document.
+    // When we have a TOC, also scan near chapter boundaries for section headings.
+    let step = (total_pages / 25).max(5);
+    let mut pages_to_scan: Vec<usize> = (1..=total_pages).step_by(step).collect();
+
+    if has_toc {
+        // Also scan ±3 pages around each chapter boundary
+        for e in &entries {
+            let p = e.page as i32;
+            for offset in -3i32..=3i32 {
+                let page = (p + offset).max(1).min(total_pages as i32) as usize;
+                pages_to_scan.push(page);
+            }
+        }
+        pages_to_scan.sort();
+        pages_to_scan.dedup();
     }
+
+    let heading_entries = extract_headings_for_pages(path, is_epub, &pages_to_scan);
 
     // Merge: prefer dot-leader entries (correct target page from TOC), supplement
     // with heading entries whose titles aren't already covered by dot-leader results.
@@ -70,7 +83,24 @@ pub fn detect_toc(path: &Path, is_epub: bool, total_pages: usize) -> Vec<TocEntr
     entries
 }
 
+/// Extract headings from a specific set of pages
+fn extract_headings_for_pages(path: &Path, is_epub: bool, pages: &[usize]) -> Vec<TocEntry> {
+    let mut entries = Vec::new();
+    for &page_num in pages {
+        let text = extract_text(path, is_epub, page_num);
+        entries.extend(extract_headings(&text, page_num));
+    }
+    entries
+}
+
+/// Extract text from a page, preferring the index cache if available (fast disk read).
+/// Falls back to pdf_oxide/epub extraction when no cache exists.
 fn extract_text(path: &Path, is_epub: bool, page_num: usize) -> String {
+    // Try index cache first — near-instant vs pdf_oxide extraction
+    if let Some(cached) = read_from_index_cache(path, page_num) {
+        return cached;
+    }
+    // Fallback: direct extraction
     if is_epub {
         crate::extract_epub_chapter(path, page_num).unwrap_or_default()
     } else {
@@ -78,29 +108,90 @@ fn extract_text(path: &Path, is_epub: bool, page_num: usize) -> String {
     }
 }
 
-/// Phase 1: Extract dot-leader TOC entries from a page.
-/// Dot-leader lines have the format "Section Title...........42" where 42 is the target page.
-fn extract_dot_leaders(text: &str, _scan_page: usize) -> Vec<TocEntry> {
-    let mut entries = Vec::new();
+/// Read a page's text from the index cache if the document is indexed and fresh
+fn read_from_index_cache(path: &Path, page_num: usize) -> Option<String> {
+    let meta = crate::index::read_valid_meta(path)?;
+    if page_num > meta.pages {
+        return None;
+    }
+    let hash_dir = crate::index::get_index_dir(path);
+    let page_file = hash_dir.join(format!("page_{:04}.txt", page_num));
+    std::fs::read_to_string(&page_file).ok()
+}
 
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() {
+/// Phase 1: Extract TOC entries from a page.
+/// Handles two common TOC formats:
+///   - Dot-leader: "Section Title...........42"
+///   - Right-aligned: "1.1 Section Title           42"
+/// Indentation level maps to hierarchy depth.
+fn extract_dot_leaders(text: &str, total_pages: usize) -> Vec<TocEntry> {
+    // Collect candidates first, then apply page-level filtering
+    let mut dot_leaders = Vec::new();
+    let mut right_aligned = Vec::new();
+
+    for raw_line in text.lines() {
+        if raw_line.trim().is_empty() {
             continue;
         }
 
-        if let Some((title, target_page)) = try_dot_leader(line) {
-            if target_page > 0 {
-                entries.push(TocEntry {
+        if let Some((title, target_page)) = try_dot_leader(raw_line) {
+            if target_page > 0 && target_page <= total_pages.saturating_add(100) {
+                dot_leaders.push(TocEntry {
                     page: target_page,
                     title,
-                    level: estimate_level_from_toc(line),
+                    level: indent_level(raw_line),
+                });
+                continue;
+            }
+        }
+
+        if let Some((title, target_page)) = try_right_aligned(raw_line) {
+            if target_page > 0 && target_page <= total_pages.saturating_add(100) {
+                right_aligned.push(TocEntry {
+                    page: target_page,
+                    title,
+                    level: indent_level(raw_line),
                 });
             }
         }
     }
 
+    // Dot-leaders are always high-confidence. Right-aligned only if ≥2 on the page
+    // (isolated matches are likely false positives from body text).
+    let mut entries = dot_leaders;
+    if right_aligned.len() >= 2 {
+        entries.extend(right_aligned);
+    }
+
     entries
+}
+
+/// Hybrid hierarchy level: tries indentation first, falls back to numbering depth
+fn indent_level(line: &str) -> usize {
+    let spaces = line.chars().take_while(|&c| c == ' ').count();
+    if spaces >= 6 { return 3; }
+    if spaces >= 3 { return 2; }
+
+    // Fallback: numbering depth (1→0, 1.1→1, 1.1.1→2)
+    numbering_level(line.trim())
+}
+
+/// Level from section numbering pattern ("1.1 Title") — dots count = depth
+fn numbering_level(text: &str) -> usize {
+    if let Some(first_word) = text.split_whitespace().next() {
+        let digits_and_dots: String = first_word.chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '.')
+            .collect();
+        if digits_and_dots.contains('.') {
+            let dots = digits_and_dots.matches('.').count();
+            return dots.min(2); // 1.1→1, 1.1.1→2
+        }
+        // Plain number like "1" or "2" → chapter
+        if digits_and_dots.chars().all(|c| c.is_ascii_digit()) && !digits_and_dots.is_empty() {
+            return 0;
+        }
+    }
+    0
 }
 
 /// Phase 2: Extract chapter/section headings from a page.
@@ -168,6 +259,41 @@ fn try_dot_leader(line: &str) -> Option<(String, usize)> {
     None
 }
 
+/// Right-aligned TOC format: "Section Title           42"
+/// PDF text extraction collapses whitespace — the page number just needs to
+/// be the last word and the title not look like a sentence.
+fn try_right_aligned(line: &str) -> Option<(String, usize)> {
+    let trimmed = line.trim();
+    let last_word = trimmed.split_whitespace().last()?;
+    let page_num = last_word.parse::<usize>().ok()?;
+    if page_num == 0 || page_num > 10000 {
+        return None;
+    }
+
+    let before_num = &trimmed[..trimmed.len() - last_word.len()];
+    let title = before_num.trim().to_string();
+    if title.len() < 2 || title.len() > 100 {
+        return None;
+    }
+
+    // Reject if it looks like a sentence
+    let word_count = title.split_whitespace().count();
+    if word_count > 8 || title.ends_with('.') || title.ends_with(',') || title.ends_with(';') {
+        return None;
+    }
+    // Title must look like a heading: numbered prefix, or short enough to be a title
+    let first_char = title.chars().next().unwrap_or(' ');
+    let has_numbered_prefix = first_char.is_ascii_digit() || first_char.is_alphabetic();
+    if !has_numbered_prefix || word_count < 2 {
+        // Short single-word or punctuation-starting lines are unlikely to be TOC entries
+        if word_count < 2 && title.len() < 3 {
+            return None;
+        }
+    }
+
+    Some((title, page_num))
+}
+
 /// Strong heading patterns only. No broad heuristics.
 fn try_chapter_heading(line: &str) -> Option<(String, usize)> {
     // Pattern 1: "Chapter N" or "Chapter N: Title" or "CHAPTER N"
@@ -180,17 +306,22 @@ fn try_chapter_heading(line: &str) -> Option<(String, usize)> {
         return Some(result);
     }
 
-    // Pattern 3: Numbered section: "N.N Title" or "N.N.N Title"
+    // Pattern 3: Numbered chapter: "N. Title" (single number + period, chapter level)
+    if let Some(result) = match_numbered_chapter(line) {
+        return Some(result);
+    }
+
+    // Pattern 4: Numbered section: "N.N Title" or "N.N.N Title"
     if let Some(result) = match_numbered_section(line) {
         return Some(result);
     }
 
-    // Pattern 4: "Part N" or "Part N: Title"
+    // Pattern 5: "Part N" or "Part N: Title"
     if let Some(result) = match_part(line) {
         return Some(result);
     }
 
-    // Pattern 5: ALL-CAPS short line (likely a heading like "INTRODUCTION" or "REFERENCES")
+    // Pattern 6: ALL-CAPS short line (likely a heading like "INTRODUCTION" or "REFERENCES")
     if let Some(result) = match_allcaps_heading(line) {
         return Some(result);
     }
@@ -242,6 +373,45 @@ fn match_cjk_chapter(line: &str) -> Option<(String, usize)> {
     Some((title, 1))
 }
 
+/// Numbered chapter: "4. Parallelism and Concurrent Programming"
+fn match_numbered_chapter(line: &str) -> Option<(String, usize)> {
+    let chars: Vec<char> = line.chars().collect();
+    let mut i = 0;
+    // Read digits
+    while i < chars.len() && chars[i].is_ascii_digit() {
+        i += 1;
+    }
+    // Must be followed by a period, then whitespace, then a title
+    if i == 0 || i >= chars.len() || chars[i] != '.' {
+        return None;
+    }
+    if i + 1 >= chars.len() || !chars[i + 1].is_whitespace() {
+        return None;
+    }
+    let num: usize = chars[..i].iter().collect::<String>().parse().ok()?;
+    // Chapter numbers are sane (≤ 50 for any book)
+    if num > 50 {
+        return None;
+    }
+    let title: String = chars[i + 1..].iter().collect();
+    let title = title.trim().to_string();
+    let word_count = title.split_whitespace().count();
+    if title.len() < 3 || title.len() > 80 || word_count > 8 || word_count < 2 {
+        return None;
+    }
+    // Title must start with uppercase and have at least one more uppercase word
+    let first_char = title.chars().next().unwrap_or(' ');
+    if !first_char.is_ascii_uppercase() {
+        return None;
+    }
+    // Reject code-like lines and body text fragments
+    if title.contains("/*") || title.contains("*/") || title.contains('{') || title.contains('}')
+        || title.contains("the ") && word_count <= 3 {
+        return None; // "1 the mesh itself" — body text
+    }
+    Some((format!("{} {}", num, title), 0))
+}
+
 fn match_numbered_section(line: &str) -> Option<(String, usize)> {
     let chars: Vec<char> = line.chars().collect();
     let mut i = 0;
@@ -283,10 +453,11 @@ fn match_part(line: &str) -> Option<(String, usize)> {
         return None;
     }
     let rest = line[5..].trim();
-    if rest.is_empty() {
+    // Must start with a number or roman numeral
+    let first_char = rest.chars().next()?;
+    if !first_char.is_ascii_digit() && !"IVXLCDMivxlcdm".contains(first_char) {
         return None;
     }
-
     // "Part I" or "Part 1: Title"
     for sep in [':', '-', '.'] {
         if let Some((num_str, title_suffix)) = rest.split_once(sep) {
@@ -294,7 +465,6 @@ fn match_part(line: &str) -> Option<(String, usize)> {
             return Some((title, 0));
         }
     }
-
     Some((format!("Part {}", rest), 0))
 }
 
@@ -327,35 +497,19 @@ fn match_allcaps_heading(line: &str) -> Option<(String, usize)> {
     None
 }
 
-/// Normalize a title for deduplication: lowercase, collapse whitespace
+/// Normalize a title for deduplication: lowercase, collapse whitespace, strip trailing number
 fn normalize_title(title: &str) -> String {
-    title.to_lowercase()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-/// Estimate level from indentation in a dot-leader TOC line
-fn estimate_level_from_toc(line: &str) -> usize {
-    // Count leading spaces as indentation proxy
-    let leading_spaces = line.chars().take_while(|&c| c == ' ').count();
-    if leading_spaces >= 8 {
-        return 3;
-    }
-    if leading_spaces >= 4 {
-        return 2;
-    }
-
-    // Check for numbered prefix depth
-    let trimmed = line.trim();
-    if let Some(first_word) = trimmed.split_whitespace().next() {
-        let dots = first_word.chars().filter(|&c| c == '.').count();
-        if dots > 0 && first_word.chars().all(|c| c.is_ascii_digit() || c == '.') {
-            return dots.min(3);
+    let lower = title.to_lowercase();
+    let mut words: Vec<&str> = lower.split_whitespace().collect();
+    // Strip trailing page number if present (Phase 2 picks these up on TOC pages)
+    if words.len() > 1 {
+        if let Some(last) = words.last() {
+            if last.parse::<usize>().is_ok() {
+                words.pop();
+            }
         }
     }
-
-    1 // default chapter level
+    words.join(" ")
 }
 
 #[cfg(test)]
@@ -441,7 +595,40 @@ mod tests {
 
     #[test]
     fn test_allcaps_non_heading_rejected() {
-        // Random ALL CAPS that isn't a known heading word
         assert!(match_allcaps_heading("RANDOM TEXT THAT IS ALL CAPS").is_none());
+    }
+
+    #[test]
+    fn test_right_aligned_simple() {
+        // Realistic extracted text — PDF doesn't preserve visual spacing
+        let result = try_right_aligned("1 Introduction 1");
+        assert!(result.is_some());
+        let (title, page) = result.unwrap();
+        assert_eq!(title, "1 Introduction");
+        assert_eq!(page, 1);
+    }
+
+    #[test]
+    fn test_right_aligned_section() {
+        let result = try_right_aligned("1.1 What Is a Game? 3");
+        assert!(result.is_some());
+        let (title, page) = result.unwrap();
+        assert_eq!(title, "1.1 What Is a Game?");
+        assert_eq!(page, 3);
+    }
+
+    #[test]
+    fn test_right_aligned_rejects_sentence() {
+        // A sentence ending with a number — too many words, should be rejected
+        assert!(try_right_aligned("This is a long sentence that ends with the number 42").is_none());
+    }
+
+    #[test]
+    fn test_indent_levels() {
+        assert_eq!(indent_level("Preface xi"), 0);
+        assert_eq!(indent_level("1 Introduction 1"), 0);
+        assert_eq!(indent_level("1.1 Section Title  3"), 1);
+        assert_eq!(indent_level("1.1.1 Subsection  5"), 2);
+        assert_eq!(indent_level("    indented section  3"), 2);
     }
 }

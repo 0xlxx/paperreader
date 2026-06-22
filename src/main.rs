@@ -257,8 +257,12 @@ fn main() {
         } else {
             pdf_oxide::PdfDocument::open(target_doc).and_then(|d| d.page_count()).unwrap_or(0)
         };
-        eprintln!("Scanning {} pages for TOC patterns...", total_pages);
+        let toc_start = std::time::Instant::now();
+        let _toc_start = std::time::Instant::now();
+        eprintln!("Scanning up to {} pages (~{} sampled) for TOC patterns...",
+            total_pages, (total_pages / 25).max(5) + 10);
         let entries = toc::detect_toc(target_doc, is_epub, total_pages);
+        eprintln!("TOC scan completed in {:.1}s", toc_start.elapsed().as_secs_f64());
 
         if args.json {
             let output = serde_json::json!({
