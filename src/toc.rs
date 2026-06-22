@@ -1,13 +1,13 @@
-//! Table of Contents extraction via two-phase heuristics.
+//! Table of Contents extraction.
 //!
-//! Phase 1: Dot-leader detection on early pages (where the printed TOC lives).
-//! Phase 2: Heading-pattern scan across ALL pages for chapter/section headings.
-//!
-//! Only strong, specific patterns are matched — no broad "title case" heuristic,
-//! to avoid body-text false positives.
+//! Strategy (in order of preference):
+//! 1. PDF embedded outlines (/Outlines in document catalog) — what PDF readers show
+//! 2. Heuristic: dot-leader TOC on early pages + heading scan
 
 use std::path::Path;
+use std::collections::HashMap;
 use serde::Serialize;
+use pdf_oxide::{PdfDocument, object::{ObjectRef, Object}};
 
 /// A detected TOC entry
 #[derive(Debug, Clone, Serialize)]
@@ -18,11 +18,218 @@ pub struct TocEntry {
     pub level: usize,
 }
 
+/// Extract the PDF's embedded outline tree (what PDF readers display as the TOC sidebar).
+/// Returns None if the PDF has no outlines or extraction fails.
+fn extract_pdf_outlines(path: &Path) -> Option<Vec<TocEntry>> {
+    let doc = PdfDocument::open(path).ok()?;
+    let catalog = doc.catalog().ok()?;
+    let catalog_dict = catalog.as_dict()?;
+
+    // Try common key names for the outline tree
+    let outlines_obj = catalog_dict.get("Outlines")
+        .or_else(|| catalog_dict.get("Outlines "))
+        .or_else(|| {
+            // Some PDFs store it indirectly — scan all keys
+            catalog_dict.iter().find(|(k, _)| {
+                k.eq_ignore_ascii_case("Outlines") || k.contains("utline")
+            }).map(|(_, v)| v)
+        })?;
+
+    let outlines_ref = outlines_obj.as_reference()?;
+    let outlines_root = doc.load_object(outlines_ref).ok()?;
+    let outlines_dict = outlines_root.as_dict()?;
+
+    // Get the first top-level outline item
+    let first_ref = match outlines_dict.get("First") {
+        Some(f) => f.as_reference()?,
+        None => {            // Some PDFs use /Kids array for outlines
+            match outlines_dict.get("Kids").and_then(|k| k.as_array()) {
+                Some(kids) => {                    let mut entries = Vec::new();
+                    for kid in kids {
+                        if let Some(kid_ref) = kid.as_reference() {
+                            walk_outline_items(&doc, kid_ref, 0, &mut entries);
+                        }
+                    }                    return Some(entries);
+                }
+                None => { eprintln!("  TOC: no /First and no /Kids"); return None; }
+            }
+        }
+    };
+    let mut entries = Vec::new();
+    walk_outline_items(&doc, first_ref, 0, &mut entries);    Some(entries)
+}
+
+/// Recursively walk the PDF outline tree (linked list via /Next and /First).
+fn walk_outline_items(doc: &PdfDocument, item_ref: ObjectRef, level: usize, entries: &mut Vec<TocEntry>) {
+    let mut current_ref = item_ref;
+    let mut visited = std::collections::HashSet::new();
+
+    loop {
+        if !visited.insert((current_ref.id, current_ref.r#gen)) {
+            break; // prevent infinite loops from malformed PDFs
+        }
+
+        let item = match doc.load_object(current_ref) {
+            Ok(o) => o,
+            Err(e) => { eprintln!("  TOC: failed to load item {:?}: {}", current_ref, e); break; }
+        };
+        let dict = match item.as_dict() {
+            Some(d) => d,
+            None => { eprintln!("  TOC: item is not a dict"); break; }
+        };
+        // Extract title
+        let title = dict.get("Title")
+            .and_then(|t| {                t.as_string()
+            })
+            .map(|bytes| {                pdf_string_to_text(bytes)
+            })
+            .unwrap_or_default();
+
+        if !title.is_empty() {
+            // Extract page number from /Dest or /A (GoTo action)
+            let page = dict.get("Dest")
+                .and_then(|d| parse_dest_page(doc, d))
+                .or_else(|| dict.get("A").and_then(|a| {                    // If /A is a reference, load it first
+                    let action_obj = if let Some(ref r) = a.as_reference() {
+                        doc.load_object(*r).ok()?
+                    } else {
+                        a.clone()
+                    };
+                    parse_action_dest(doc, &action_obj)
+                }))
+                .unwrap_or(0);
+            if page > 0 {
+                entries.push(TocEntry { page, title, level });
+            }
+        }
+
+        // Process children first (they come before next sibling in display)
+        if let Some(child_ref) = dict.get("First").and_then(|c| c.as_reference()) {
+            walk_outline_items(doc, child_ref, level + 1, entries);
+        }
+
+        // Move to next sibling
+        match dict.get("Next").and_then(|n| n.as_reference()) {
+            Some(next) => current_ref = next,
+            None => break,
+        }
+    }
+}
+
+/// Parse a PDF GoTo action (/A dict) to get the destination page number.
+fn parse_action_dest(doc: &PdfDocument, action: &Object) -> Option<usize> {
+    let action_dict = action.as_dict()?;    let s = action_dict.get("S")?.as_name()?;    if s != "GoTo" { return None; }
+    let dest = action_dict.get("D")?;    parse_dest_page(doc, dest)
+}
+
+/// Parse a PDF destination (/Dest) to get the page number (1-indexed).
+/// Dest can be: [page_ref /XYZ ...] or [page_ref /Fit] or just a page number.
+fn parse_dest_page(doc: &PdfDocument, dest: &Object) -> Option<usize> {
+    match dest {
+        // Array format: [page_ref /Fit] or [page_idx /XYZ ...]
+        Object::Array(arr) => {
+            let first = arr.first()?;            if let Some(page_idx) = first.as_integer() {
+                return Some((page_idx + 1) as usize);
+            }
+            if let Some(page_ref) = first.as_reference() {
+                return page_ref_to_index(doc, page_ref);
+            }
+            None
+        }
+        // Named destination (string) — resolve from /Dests name tree
+        Object::String(name_bytes) => {
+            let name = String::from_utf8_lossy(name_bytes);            resolve_named_dest(doc, name_bytes)
+        }
+        // Integer page number directly
+        Object::Integer(idx) => Some((*idx + 1) as usize),
+        _ => { eprintln!("  TOC: unexpected dest type: {}", dest.type_name()); None }
+    }
+}
+
+/// Resolve a named destination from the document's /Dests name tree.
+fn resolve_named_dest(doc: &PdfDocument, name: &[u8]) -> Option<usize> {
+    let catalog = doc.catalog().ok()?;
+    let catalog_dict = catalog.as_dict()?;
+    let dests = catalog_dict.get("Dests")?;    // /Dests can be a dict or a reference to a dict
+    let dests_dict = if let Some(d) = dests.as_dict() {
+        d.clone()
+    } else if let Some(r) = dests.as_reference() {
+        doc.load_object(r).ok()?.as_dict()?.clone()
+    } else {
+        return None;
+    };
+    let name_str = String::from_utf8_lossy(name);
+    let dest_obj = dests_dict.get(name_str.as_ref())?;
+    parse_dest_page(doc, dest_obj)
+}
+
+/// Map a page object reference to its 1-indexed page number by scanning the page tree.
+fn page_ref_to_index(doc: &PdfDocument, target_ref: ObjectRef) -> Option<usize> {
+    let catalog = doc.catalog().ok()?;
+    let catalog_dict = catalog.as_dict()?;
+    let pages_root = catalog_dict.get("Pages")?.as_reference()?;
+    let pages_obj = doc.load_object(pages_root).ok()?;
+    let pages_dict = pages_obj.as_dict()?;
+
+    let mut page_refs = Vec::new();
+    collect_page_refs(doc, pages_dict, &mut page_refs);
+    page_refs.iter().position(|&r| r == target_ref).map(|i| i + 1)
+}
+
+/// Recursively collect page references from the page tree (/Kids arrays).
+fn collect_page_refs(doc: &PdfDocument, node: &HashMap<String, Object>, refs: &mut Vec<ObjectRef>) {
+    if let Some(type_name) = node.get("Type").and_then(|t| t.as_name()) {
+        if type_name == "Page" {
+            return; // leaf pages are collected by their parent
+        }
+    }
+
+    if let Some(kids) = node.get("Kids").and_then(|k| k.as_array()) {
+        for kid in kids {
+            if let Some(kid_ref) = kid.as_reference() {
+                if let Ok(kid_obj) = doc.load_object(kid_ref) {
+                    if let Some(kid_dict) = kid_obj.as_dict() {
+                        if let Some(type_name) = kid_dict.get("Type").and_then(|t| t.as_name()) {
+                            if type_name == "Page" {
+                                refs.push(kid_ref);
+                            } else if type_name == "Pages" {
+                                collect_page_refs(doc, kid_dict, refs);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Convert PDF-encoded string bytes to UTF-8 text.
+fn pdf_string_to_text(bytes: &[u8]) -> String {
+    // Try UTF-16BE (PDF standard encoding for text strings)
+    if bytes.len() >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF {
+        let utf16: Vec<u16> = bytes[2..].chunks(2)
+            .filter(|c| c.len() == 2)
+            .map(|c| u16::from_be_bytes([c[0], c[1]]))
+            .collect();
+        return String::from_utf16(&utf16).unwrap_or_default();
+    }
+    // Try plain UTF-8 / ASCII
+    String::from_utf8(bytes.to_vec()).unwrap_or_default()
+}
+
 /// Detect TOC from a PDF or EPUB file.
 ///
 /// Two-phase: first scan early pages for dot-leader TOC entries (with target page
 /// numbers), then scan every page for chapter/section heading patterns.
 pub fn detect_toc(path: &Path, total_pages: usize) -> Vec<TocEntry> {
+    // Try PDF embedded outlines first — what PDF readers use for the TOC sidebar
+    if let Some(outlines) = extract_pdf_outlines(path) {
+        if !outlines.is_empty() {
+            return outlines;
+        }
+    }
+
+    // Fallback: heuristic detection
     // Phase 1: Dot-leader TOC from early pages
     let mut entries: Vec<TocEntry> = Vec::new();
     let scan_pages = total_pages.min(15);
@@ -400,15 +607,27 @@ fn match_numbered_chapter(line: &str) -> Option<(String, usize)> {
     if title.len() < 3 || title.len() > 80 || word_count > 8 || word_count < 2 {
         return None;
     }
-    // Title must start with uppercase and have at least one more uppercase word
+    // Title must start with uppercase
     let first_char = title.chars().next().unwrap_or(' ');
     if !first_char.is_ascii_uppercase() {
         return None;
     }
-    // Reject code-like lines and body text fragments
-    if title.contains("/*") || title.contains("*/") || title.contains('{') || title.contains('}')
-        || title.contains("the ") && word_count <= 3 {
-        return None; // "1 the mesh itself" — body text
+    // Reject code-like lines
+    if title.contains("/*") || title.contains("*/") || title.contains('{') || title.contains('}') {
+        return None;
+    }
+    // Title case check: count lowercase-starting words. Chapter headings have ≤2
+    // (prepositions like "of", "and"). Body text has ≥3 lowercase starters.
+    let lowercase_words: usize = title.split_whitespace()
+        .filter(|w| w.starts_with(|c: char| c.is_ascii_lowercase()))
+        .count();
+    if lowercase_words > 2 {
+        return None;
+    }
+    // Reject common body-text markers
+    let lower = title.to_lowercase();
+    for body_word in &["might", "should", "will", "can ", "may ", "does ", "has ", "the target"] {
+        if lower.contains(body_word) && word_count > 4 { return None; }
     }
     Some((format!("{} {}", num, title), 0))
 }
