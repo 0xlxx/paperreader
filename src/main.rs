@@ -141,10 +141,12 @@ fn main() {
 
     // 1. 构建/重建文本索引
     if args.index || args.reindex {
-        if pdfs.is_empty() && epubs.is_empty() {
+        let mut all_docs = pdfs.clone();
+        all_docs.extend(epubs.clone());
+        if all_docs.is_empty() {
             exit_no_docs();
         }
-        index::build_index(&directory, args.reindex);
+        index::build_index(&all_docs, args.reindex);
         return;
     }
 
@@ -255,9 +257,8 @@ fn main() {
         } else {
             pdf_oxide::PdfDocument::open(target_doc).and_then(|d| d.page_count()).unwrap_or(0)
         };
-        let scan_pages = total_pages.min(25);
-        eprintln!("Scanning first {} of {} pages for TOC patterns...", scan_pages, total_pages);
-        let entries = toc::detect_toc(target_doc, is_epub, scan_pages);
+        eprintln!("Scanning {} pages for TOC patterns...", total_pages);
+        let entries = toc::detect_toc(target_doc, is_epub, total_pages);
 
         if args.json {
             let output = serde_json::json!({
@@ -267,18 +268,12 @@ fn main() {
             println!("{}", serde_json::to_string_pretty(&output).unwrap());
         } else {
             if entries.is_empty() {
-                println!("No TOC entries detected in first {} pages.", scan_pages);
+                println!("No TOC entries detected in {} pages.", total_pages);
             } else {
                 println!("\n  Table of Contents ({} entries):\n", entries.len());
                 for entry in &entries {
                     let indent = "  ".repeat(entry.level.min(3));
-                    if entry.level < 100 {
-                        println!("{}  {}", indent, entry.title);
-                    } else {
-                        let real_level = entry.level - 100;
-                        let indent = "  ".repeat(real_level.min(3));
-                        println!("{}(p{})  {}", indent, entry.page, entry.title);
-                    }
+                    println!("{}{}  (p{})", indent, entry.title, entry.page);
                 }
             }
         }

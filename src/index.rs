@@ -8,9 +8,6 @@ use rayon::prelude::*;
 use pdf_oxide::PdfDocument;
 use epub::doc::EpubDoc;
 
-use crate::pdf::find_pdfs;
-use crate::epub::find_epubs;
-
 /// 缓存文档索引的元数据
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct DocumentMeta {
@@ -189,17 +186,14 @@ pub fn index_one_doc(doc_path: &Path) {
 }
 
 /// 对指定目录下所有未索引或过期的 PDF 和 EPUB 文档构建文本索引
-pub fn build_index(directory: &Path, force: bool) -> usize {
-    let mut docs = find_pdfs(directory, None);
-    docs.extend(find_epubs(directory, None));
-
+pub fn build_index(docs: &[PathBuf], force: bool) -> usize {
     if docs.is_empty() {
-        println!("No PDFs or EPUBs found in {}", directory.display());
+        println!("No PDFs or EPUBs found.");
         return 0;
     }
 
     let mut to_index = Vec::new();
-    for doc in &docs {
+    for doc in docs {
         if !force && read_valid_meta(doc).is_some() {
             continue;
         }
