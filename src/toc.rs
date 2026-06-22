@@ -38,13 +38,16 @@ pub fn detect_toc(path: &Path, total_pages: usize) -> Vec<TocEntry> {
 
     let has_toc = entries.len() >= 3;
 
-    // Phase 2: Heading scan. Always do a sampling pass across the document.
-    // When we have a TOC, also scan near chapter boundaries for section headings.
-    let step = (total_pages / 25).max(5);
-    let mut pages_to_scan: Vec<usize> = (1..=total_pages).step_by(step).collect();
+    // Phase 2: Heading scan. If the index cache covers this document, scan
+    // ALL pages (near-instant from disk cache). Otherwise sample ~25 pages.
+    let index_available = crate::index::read_valid_meta(path).is_some();
 
-    if has_toc {
-        // Also scan ±3 pages around each chapter boundary
+    let heading_entries = if index_available {
+        // Full scan: read every page from index cache (~100ms for 800+ pages)
+        extract_headings_for_pages(path, &(1..=total_pages).collect::<Vec<_>>())
+    } else if has_toc {
+        // Sample + boundary scan around known chapter pages
+        let mut pages_to_scan: Vec<usize> = (1..=total_pages).step_by((total_pages / 25).max(5)).collect();
         for e in &entries {
             let p = e.page as i32;
             for offset in -3i32..=3i32 {
@@ -54,9 +57,11 @@ pub fn detect_toc(path: &Path, total_pages: usize) -> Vec<TocEntry> {
         }
         pages_to_scan.sort();
         pages_to_scan.dedup();
-    }
-
-    let heading_entries = extract_headings_for_pages(path, &pages_to_scan);
+        extract_headings_for_pages(path, &pages_to_scan)
+    } else {
+        // No index, no TOC: sample ~25 pages
+        extract_headings_for_pages(path, &(1..=total_pages).step_by((total_pages / 25).max(5)).collect::<Vec<_>>())
+    };
 
     // Merge: prefer dot-leader entries (correct target page from TOC), supplement
     // with heading entries whose titles aren't already covered by dot-leader results.
