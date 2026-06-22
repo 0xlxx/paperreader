@@ -22,13 +22,13 @@ pub struct TocEntry {
 ///
 /// Two-phase: first scan early pages for dot-leader TOC entries (with target page
 /// numbers), then scan every page for chapter/section heading patterns.
-pub fn detect_toc(path: &Path, is_epub: bool, total_pages: usize) -> Vec<TocEntry> {
+pub fn detect_toc(path: &Path, total_pages: usize) -> Vec<TocEntry> {
     // Phase 1: Dot-leader TOC from early pages
     let mut entries: Vec<TocEntry> = Vec::new();
     let scan_pages = total_pages.min(15);
 
     for page_num in 1..=scan_pages {
-        let page_entries = extract_dot_leaders(&extract_text(path, is_epub, page_num), total_pages);
+        let page_entries = extract_dot_leaders(&extract_text(path, page_num), total_pages);
         entries.extend(page_entries);
         // Early exit once we have enough entries
         if entries.len() >= 10 {
@@ -56,7 +56,7 @@ pub fn detect_toc(path: &Path, is_epub: bool, total_pages: usize) -> Vec<TocEntr
         pages_to_scan.dedup();
     }
 
-    let heading_entries = extract_headings_for_pages(path, is_epub, &pages_to_scan);
+    let heading_entries = extract_headings_for_pages(path, &pages_to_scan);
 
     // Merge: prefer dot-leader entries (correct target page from TOC), supplement
     // with heading entries whose titles aren't already covered by dot-leader results.
@@ -84,10 +84,10 @@ pub fn detect_toc(path: &Path, is_epub: bool, total_pages: usize) -> Vec<TocEntr
 }
 
 /// Extract headings from a specific set of pages
-fn extract_headings_for_pages(path: &Path, is_epub: bool, pages: &[usize]) -> Vec<TocEntry> {
+fn extract_headings_for_pages(path: &Path, pages: &[usize]) -> Vec<TocEntry> {
     let mut entries = Vec::new();
     for &page_num in pages {
-        let text = extract_text(path, is_epub, page_num);
+        let text = extract_text(path, page_num);
         entries.extend(extract_headings(&text, page_num));
     }
     entries
@@ -95,17 +95,13 @@ fn extract_headings_for_pages(path: &Path, is_epub: bool, pages: &[usize]) -> Ve
 
 /// Extract text from a page, preferring the index cache if available (fast disk read).
 /// Falls back to pdf_oxide/epub extraction when no cache exists.
-fn extract_text(path: &Path, is_epub: bool, page_num: usize) -> String {
+fn extract_text(path: &Path, page_num: usize) -> String {
     // Try index cache first — near-instant vs pdf_oxide extraction
     if let Some(cached) = read_from_index_cache(path, page_num) {
         return cached;
     }
     // Fallback: direct extraction
-    if is_epub {
-        crate::extract_epub_chapter(path, page_num).unwrap_or_default()
-    } else {
-        crate::pdf::extract_page(path, page_num).unwrap_or_default()
-    }
+    crate::pdf::extract_page(path, page_num).unwrap_or_default()
 }
 
 /// Read a page's text from the index cache if the document is indexed and fresh

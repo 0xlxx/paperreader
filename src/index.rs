@@ -6,7 +6,6 @@ use serde::{Serialize, Deserialize};
 use sha2::{Sha256, Digest};
 use rayon::prelude::*;
 use pdf_oxide::PdfDocument;
-use epub::doc::EpubDoc;
 
 /// 缓存文档索引的元数据
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -85,12 +84,14 @@ pub fn index_one_doc(doc_path: &Path) {
     }
 
     let ext = doc_path.extension().map(|s| s.to_ascii_lowercase());
-    let mut total_pages = 0;
+    let total_pages;
     let mut indexed_pages = 0usize;
     let mut indexed_words = 0usize;
 
-    if ext == Some(std::ffi::OsString::from("pdf")) {
-        // PDF 索引构建逻辑：使用 pdf_oxide 逐页提取并写入临时 page_NNNN.txt
+    if ext != Some(std::ffi::OsString::from("pdf")) {
+        return; // skip non-PDF files
+    }
+    {
         let doc = match PdfDocument::open(doc_path) {
             Ok(d) => d,
             Err(e) => {
@@ -118,33 +119,6 @@ pub fn index_one_doc(doc_path: &Path) {
                 eprintln!("  Warning: failed to write page file {:?}: {}", page_file, e);
             }
         }
-    } else if ext == Some(std::ffi::OsString::from("epub")) {
-        // EPUB 索引构建逻辑：使用 epub-rs 按 spine 章节抽取、清洗 HTML 格式并写入
-        let mut doc = match EpubDoc::new(doc_path) {
-            Ok(d) => d,
-            Err(e) => {
-                eprintln!("  Warning: failed to open EPUB {}: {}", doc_path.display(), e);
-                return;
-            }
-        };
-        let spine_len = doc.spine.len();
-        let mut valid_chapters = 0;
-        for i in 0..spine_len {
-            doc.set_current_chapter(i);
-            if let Some((content, _)) = doc.get_current_str() {
-                let text = crate::epub::html_to_text(&content);
-                if !text.is_empty() {
-                    valid_chapters += 1;
-                    indexed_words += text.split_whitespace().count();
-                    let page_file = hash_dir.join(format!("page_{:04}.txt", valid_chapters));
-                    if let Err(e) = fs::write(&page_file, text) {
-                        eprintln!("  Warning: failed to write chapter file {:?}: {}", page_file, e);
-                    }
-                }
-            }
-        }
-        total_pages = valid_chapters;
-        indexed_pages = valid_chapters;
     }
 
     if total_pages == 0 {
@@ -236,14 +210,7 @@ fn print_index_stats(docs: &[PathBuf]) {
             total_indexed += meta.indexed_pages;
             total_words += meta.indexed_words;
         } else {
-            // Try to get page count without index for unindexed docs
-            let ext = doc.extension().map(|s| s.to_ascii_lowercase());
-            let pages = if ext == Some(std::ffi::OsString::from("epub")) {
-                EpubDoc::new(doc).map(|d| d.spine.len()).unwrap_or(0)
-            } else {
-                PdfDocument::open(doc).and_then(|d| d.page_count()).unwrap_or(0)
-            };
-            total_pages += pages;
+            total_pages += PdfDocument::open(doc).and_then(|d| d.page_count()).unwrap_or(0);
         }
     }
 

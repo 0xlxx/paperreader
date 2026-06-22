@@ -75,7 +75,6 @@ pub fn search_pdf(
         }
     };
 
-    // 核心代码：多页文本提取并保存到临时文件
     for page_idx in 0..page_count {
         let page_num = page_idx + 1;
         if !label.is_empty() {
@@ -89,7 +88,7 @@ pub fn search_pdf(
     }
 
     if !label.is_empty() {
-        eprint!("\r\x1b[K"); // 清除终端当前的提取进度行
+        eprint!("\r\x1b[K");
     }
 
     let mut index_map = std::collections::HashMap::new();
