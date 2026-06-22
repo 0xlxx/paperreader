@@ -35,17 +35,17 @@ paperreader -c 3 "query"                   # 3 lines of context around each matc
 paperreader --case-sensitive "Query"       # Case-sensitive
 ```
 
-`--index` prints aggregate page/word stats after completion and warns on unindexable pages. `--no-index` prints a time estimate before searching. Zero-result searches include index diagnostics (`indexed_pages` vs `total_pages`) to distinguish "index failed" from "term absent".
+`--index` prints page/word stats and warns on unindexable pages. `--no-index` prints a time estimate before searching. Zero-result searches include index diagnostics to distinguish "index failed" from "term absent".
 
 ## List & inspect
 
 ```bash
 paperreader --list --json              # Catalog with pages, size, indexed_pages, indexed_words
-paperreader --file "paper.pdf" --toc   # Heuristic TOC from first ~25 pages (dot-leaders, chapter headings, 第X章)
+paperreader --file "paper.pdf" --toc   # Extract TOC with page numbers and hierarchy levels
 paperreader --file "paper.pdf" --check # CJK character coverage check (samples 3 pages)
 ```
 
-`--list` shows per-document index quality (`indexed_pages`/`indexed_words`) when available. `--toc --json` returns structured entries with page numbers. `--check` samples at 25%/50%/75% and reports CJK ratio — quick quality check for Chinese/Japanese/Korean PDFs.
+`--list` shows per-document index quality (`indexed_pages`/`indexed_words`) when available. `--toc --json` returns structured entries with page numbers and hierarchy levels (0=part, 1=chapter, 2=section, 3=subsection). `--check` samples 3 pages and reports CJK character ratio.
 
 ## JSON output
 
