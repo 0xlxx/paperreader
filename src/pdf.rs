@@ -101,6 +101,8 @@ pub fn search_pdf(
         pages: page_count,
         mtime: 0.0,
         size: 0,
+        indexed_pages: page_count,
+        indexed_words: 0,
     };
     index_map.insert(hash_dir_str, meta);
 

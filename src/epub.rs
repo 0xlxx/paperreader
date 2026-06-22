@@ -131,6 +131,8 @@ pub fn search_epub(
         pages: valid_chapters,
         mtime: 0.0,
         size: 0,
+        indexed_pages: valid_chapters,
+        indexed_words: 0,
     };
     index_map.insert(hash_dir_str, meta);
 

@@ -57,6 +57,14 @@ pub struct Cli {
     #[arg(long)]
     pub extract_page: Option<usize>,
 
+    /// Extract text from a range of pages (e.g. "3-10", "67,68,69", "1,3-5,10")
+    #[arg(long)]
+    pub extract_range: Option<String>,
+
+    /// Extract only the first N lines of each page (default 1 if no value given)
+    #[arg(long, num_args = 0..=1)]
+    pub head: Option<Option<usize>>,
+
     /// List all PDFs/EPUBs with metadata, don't search
     #[arg(long)]
     pub list: bool,
@@ -72,4 +80,12 @@ pub struct Cli {
     /// Skip index, search PDFs/EPUBs directly
     #[arg(long)]
     pub no_index: bool,
+
+    /// Extract table of contents (scans first ~20 pages for chapter headings and dot-leader patterns)
+    #[arg(long)]
+    pub toc: bool,
+
+    /// Check CJK text extraction quality by sampling random pages and reporting character coverage
+    #[arg(long)]
+    pub check: bool,
 }

@@ -19,6 +19,12 @@ pub struct DocumentMeta {
     pub mtime: f64,
     pub size: u64,
     pub pages: usize,
+    /// Pages that actually yielded text (may be < pages for scanned/image-heavy PDFs)
+    #[serde(default)]
+    pub indexed_pages: usize,
+    /// Total words extracted across all indexed pages
+    #[serde(default)]
+    pub indexed_words: usize,
 }
 
 /// 对绝对路径进行哈希，生成16位标识符作为索引的文件夹名称
@@ -83,6 +89,8 @@ pub fn index_one_doc(doc_path: &Path) {
 
     let ext = doc_path.extension().map(|s| s.to_ascii_lowercase());
     let mut total_pages = 0;
+    let mut indexed_pages = 0usize;
+    let mut indexed_words = 0usize;
 
     if ext == Some(std::ffi::OsString::from("pdf")) {
         // PDF 索引构建逻辑：使用 pdf_oxide 逐页提取并写入临时 page_NNNN.txt
@@ -104,6 +112,10 @@ pub fn index_one_doc(doc_path: &Path) {
         for page_idx in 0..page_count {
             let page_num = page_idx + 1;
             let text = doc.extract_text(page_idx).unwrap_or_default();
+            if !text.trim().is_empty() {
+                indexed_pages += 1;
+                indexed_words += text.split_whitespace().count();
+            }
             let page_file = hash_dir.join(format!("page_{:04}.txt", page_num));
             if let Err(e) = fs::write(&page_file, text) {
                 eprintln!("  Warning: failed to write page file {:?}: {}", page_file, e);
@@ -126,6 +138,7 @@ pub fn index_one_doc(doc_path: &Path) {
                 let text = crate::epub::html_to_text(&content);
                 if !text.is_empty() {
                     valid_chapters += 1;
+                    indexed_words += text.split_whitespace().count();
                     let page_file = hash_dir.join(format!("page_{:04}.txt", valid_chapters));
                     if let Err(e) = fs::write(&page_file, text) {
                         eprintln!("  Warning: failed to write chapter file {:?}: {}", page_file, e);
@@ -134,6 +147,7 @@ pub fn index_one_doc(doc_path: &Path) {
             }
         }
         total_pages = valid_chapters;
+        indexed_pages = valid_chapters;
     }
 
     if total_pages == 0 {
@@ -162,6 +176,8 @@ pub fn index_one_doc(doc_path: &Path) {
         mtime,
         size: stat.len(),
         pages: total_pages,
+        indexed_pages,
+        indexed_words,
     };
 
     let meta_file = hash_dir.join("meta.json");
@@ -192,6 +208,7 @@ pub fn build_index(directory: &Path, force: bool) -> usize {
 
     if to_index.is_empty() {
         println!("All {} document(s) already indexed. Use --reindex to force rebuild.", docs.len());
+        print_index_stats(&docs);
         return 0;
     }
 
@@ -207,5 +224,44 @@ pub fn build_index(directory: &Path, force: bool) -> usize {
 
     let elapsed = start.elapsed();
     println!("Indexed {} document(s) in {:.2}s", to_index.len(), elapsed.as_secs_f64());
+    print_index_stats(&docs);
     to_index.len()
+}
+
+/// Print aggregate index statistics for a set of documents
+fn print_index_stats(docs: &[PathBuf]) {
+    let mut total_pages = 0usize;
+    let mut total_indexed = 0usize;
+    let mut total_words = 0usize;
+    let mut docs_with_index = 0usize;
+
+    for doc in docs {
+        if let Some(meta) = read_valid_meta(doc) {
+            docs_with_index += 1;
+            total_pages += meta.pages;
+            total_indexed += meta.indexed_pages;
+            total_words += meta.indexed_words;
+        } else {
+            // Try to get page count without index for unindexed docs
+            let ext = doc.extension().map(|s| s.to_ascii_lowercase());
+            let pages = if ext == Some(std::ffi::OsString::from("epub")) {
+                EpubDoc::new(doc).map(|d| d.spine.len()).unwrap_or(0)
+            } else {
+                PdfDocument::open(doc).and_then(|d| d.page_count()).unwrap_or(0)
+            };
+            total_pages += pages;
+        }
+    }
+
+    if docs_with_index > 0 {
+        println!("  {} document(s) total: {} pages, {} indexed ({}%), {} words",
+            docs.len(), total_pages, total_indexed,
+            if total_pages > 0 { total_indexed * 100 / total_pages } else { 0 },
+            total_words);
+        if total_indexed < total_pages {
+            println!("  ⚠ {} page(s) could not be indexed (possible scanned images or embedded fonts).",
+                total_pages - total_indexed);
+            println!("    Use --no-index for direct file search, or run OCR first.");
+        }
+    }
 }
