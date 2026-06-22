@@ -277,9 +277,18 @@ fn main() {
             unindexed_docs.len(), total, ((total as f64 * 0.02) as u32).max(1), ((total as f64 * 0.05) as u32).max(2));
     }
 
-    for (i, doc) in unindexed_docs.iter().enumerate() {
-        let label = format!("{}  [{}/{}]", doc.file_name().unwrap_or_default().to_string_lossy(), i + 1, unindexed_docs.len());
-        all_results.extend(search_pdf(doc, &query, args.regex, args.context, case_sensitive, &label));
+    // Parallelize across PDFs — each PDF gets its own PdfDocument, no I/O contention
+    use rayon::prelude::*;
+    let pdf_results: Vec<Vec<search::SearchResult>> = unindexed_docs
+        .par_iter()
+        .enumerate()
+        .map(|(i, doc)| {
+            let label = format!("{}  [{}/{}]", doc.file_name().unwrap_or_default().to_string_lossy(), i + 1, unindexed_docs.len());
+            search_pdf(doc, &query, args.regex, args.context, case_sensitive, &label)
+        })
+        .collect();
+    for r in pdf_results {
+        all_results.extend(r);
     }
 
     for txt in &txts {
