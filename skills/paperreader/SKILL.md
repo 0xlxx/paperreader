@@ -7,6 +7,36 @@ description: Index, search, extract pages, and detect TOC in PDF papers with pap
 
 Search, catalog, and read local papers (PDF) and notes (TXT). Structured JSON output with page/chapter divisions. Native CJK text extraction.
 
+## Research workflow
+
+To minimize token consumption when researching a topic across large documents:
+
+### 1. Survey — find the relevant chapter
+
+```bash
+paperreader --file "book.pdf" --toc --json    # ~63 entries, ~1K tokens
+```
+
+Parse the TOC. Identify which chapter title matches the research topic. Note the `page` of that chapter AND the `page` of the next chapter (or end of document).
+
+### 2. Extract — pull only the relevant range
+
+```bash
+paperreader --file "book.pdf" --extract-range 47-92   # chapter 4 only
+```
+
+Read the extracted text directly. One chapter is ~20-40 pages, far fewer tokens than searching the entire document. No search results to parse, no false positives.
+
+### 3. Search only when you need precision
+
+If the chapter covers the topic but you need specific details, search with a narrow scoped query:
+
+```bash
+paperreader --file "book.pdf" "specific term" --json   # targeted search
+```
+
+**Anti-pattern**: `paperreader -d /papers "broad topic" --json` → 700+ matches across all documents, ~50K tokens before you've read a single page.
+
 ## Deep reading
 
 When a search match lands on page N, **never guess** surrounding context from the snippet. Pull the full page — it carries the actual explanation, formula, or table:
