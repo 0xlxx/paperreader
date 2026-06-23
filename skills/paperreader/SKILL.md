@@ -9,33 +9,38 @@ Search, catalog, and read local papers (PDF) and notes (TXT). Structured JSON ou
 
 ## Research workflow
 
-To minimize token consumption when researching a topic across large documents:
+Three strategies, ordered by token efficiency:
 
-### 1. Survey — find the relevant chapter
-
-```bash
-paperreader --file "book.pdf" --toc --json    # ~63 entries, ~1K tokens
-```
-
-Parse the TOC. Identify which chapter title matches the research topic. Note the `page` of that chapter AND the `page` of the next chapter (or end of document).
-
-### 2. Extract — pull only the relevant range
+### A. TOC → targeted extract (most efficient)
 
 ```bash
-paperreader --file "book.pdf" --extract-range 47-92   # chapter 4 only
+# 1. Survey: ~63 entries, ~1K tokens
+paperreader --file "book.pdf" --toc --json
+
+# 2. Identify relevant section pages. Extract only those pages, not the whole chapter.
+#    "Lock-Free Concurrency" on p285 → extract p285-290 (~5 pages, ~2.5K tokens)
+paperreader --file "book.pdf" --extract-range 285-290
 ```
 
-Read the extracted text directly. One chapter is ~20-40 pages, far fewer tokens than searching the entire document. No search results to parse, no false positives.
+Total: ~3.5K tokens for targeted reading. No search overhead.
 
-### 3. Search only when you need precision
-
-If the chapter covers the topic but you need specific details, search with a narrow scoped query:
+### B. TOC → chapter extract (good for deep reading)
 
 ```bash
-paperreader --file "book.pdf" "specific term" --json   # targeted search
+# 1. TOC to find the chapter
+# 2. Extract the whole chapter (~30 pages, ~15K tokens)
+paperreader --file "book.pdf" --extract-range 204-235
 ```
 
-**Anti-pattern**: `paperreader -d /papers "broad topic" --json` → 700+ matches across all documents, ~50K tokens before you've read a single page.
+### C. Search (use when you don't know where to look)
+
+```bash
+paperreader --file "book.pdf" "specific term" --json
+# 97 matches → ~8K tokens. Snippets lack context — use --extract-page to pull
+# full pages for matches that look relevant.
+```
+
+**Anti-pattern**: `paperreader -d /papers "broad topic" --json` → 700+ matches across all documents, ~50K tokens before you've read anything.
 
 ## Deep reading
 
