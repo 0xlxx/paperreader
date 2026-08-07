@@ -86,7 +86,18 @@ Extraction priority (aligned with ISO 32000-1):
 2. **Printed TOC pages** — detects the 目录/Contents page(s), then parses entries. A fast plain-text pass (dot leaders, right-aligned page numbers, wrapped-title continuations, multi-column grid TOCs) covers most textbooks in ~0.02s; when plain text is garbled (broken ToUnicode CMaps, interleaved page numbers), a layout-aware pass uses word geometry (right-aligned page runs, indentation, font size) on only the marker page ±2 pages.
 3. **Heading scan** — last resort: scan (sampled) pages for strong chapter/section heading patterns.
 
-Page numbers are reported as **physical 1-indexed pages** (usable with `--extract-page`/`--extract-range`): each title is located in the body (via the on-disk index cache when available, else a sampled scan), which derives the median front-matter offset between printed and physical page numbers and corrects every entry. Indexed documents scan the whole body in ~0.1s; unindexed documents sample pages.
+Page numbers are reported as **physical 1-indexed pages** (usable with `--extract-page`/`--extract-range`): each title is located in the body (via the on-disk index cache when available, else a sampled scan), which derives the median front-matter offset between printed and physical page numbers and corrects every entry. Indexed documents scan the whole body in ~0.1s; unindexed documents sample pages, so pages may be approximate (±10 on very large books).
+
+**For exact pages, index first:**
+
+```bash
+paperreader --file "book.pdf" --index   # one-time full-text cache (~2s per 854-page book)
+paperreader --file "book.pdf" --toc     # now resolves every page exactly, ~0.05s
+```
+
+`--index` extracts every page's text once and caches it on disk (keyed by path hash; invalidated when the file changes). `--toc` uses that cache for the body-wide title search; without it, `--toc` still works but page numbers come from a sampled scan.
+
+Some tech books (e.g. CRC/Taylor & Francis titles like *Game Engine Architecture* Vol 2) put the printed TOC's **page-number column outside the text layer** (rendered as non-text). `--toc` still extracts the clean chapter/section tree from the TOC and resolves physical pages by locating each title in the body — with `--index` the pages are exact.
 
 The whole extraction opens the PDF **once** (page count + outline + heuristics share the same document).
 
