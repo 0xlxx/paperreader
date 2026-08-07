@@ -1845,6 +1845,8 @@ fn match_cjk_heading(line: &str) -> Option<(String, usize)> {
         ("模块", 1),
         ("课", 2),
         ("节", 2),
+        ("條", 2),
+        ("条", 2),
     ] {
         if let Some(after) = rest.strip_prefix(unit) {
             let after = after.trim();
@@ -2070,7 +2072,7 @@ fn cjk_heading_rest(t: &str) -> Option<&str> {
         return None;
     }
     let rest = &s[num_len..];
-    for unit in ["单元", "部分", "篇", "章", "专题", "讲", "模块", "课", "节"] {
+    for unit in ["单元", "部分", "篇", "章", "专题", "讲", "模块", "课", "节", "條", "条"] {
         if let Some(after) = rest.strip_prefix(unit) {
             let after = after.trim();
             if after.is_empty() {
@@ -2164,7 +2166,7 @@ fn is_num_token(s: &str) -> bool {
 fn is_unit_word(s: &str) -> bool {
     matches!(
         s,
-        "课" | "章" | "单元" | "节" | "讲" | "篇" | "部分" | "专题" | "模块" | "框"
+        "课" | "章" | "单元" | "节" | "讲" | "篇" | "部分" | "专题" | "模块" | "框" | "條" | "条"
     )
 }
 
