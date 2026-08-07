@@ -1648,6 +1648,9 @@ fn extract_headings(text: &str, page_num: usize) -> Vec<TocEntry> {
             continue;
         }
         if let Some((title, level)) = try_chapter_heading(line) {
+            if entry_is_junk(&title) {
+                continue; // garbled ToUnicode / chart-label noise
+            }
             entries.push(TocEntry {
                 page: page_num,
                 title,
