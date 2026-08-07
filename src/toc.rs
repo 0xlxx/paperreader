@@ -219,7 +219,7 @@ fn heuristic_toc(doc: &PdfDocument, path: &Path, total_pages: usize) -> (Vec<Toc
     // Only pages near a plain-text 目录/Contents marker are layout-extracted,
     // which bounds the cost to a handful of pages instead of the whole front
     // matter.
-    let toc = find_toc_pages(doc, total_pages, Some(&plain.markers));
+    let toc = find_toc_pages(doc, total_pages, &plain.candidates, &plain.markers);
     if !toc.pages.is_empty() {
         let mut entries = parse_toc_pages(&toc, total_pages);
         if entries.len() >= 3 {
@@ -359,6 +359,10 @@ struct PlainScan {
     /// rejected) — used to seed the layout scan so it only extracts geometry
     /// for pages near the marker instead of the whole front matter.
     markers: Vec<usize>,
+    /// Pages near a marker that plain text actually found TOC-ish content on
+    /// (a marker or ≥1 parseable entry). The layout scan extracts geometry
+    /// only for these, instead of every page in the marker ±2 window.
+    candidates: Vec<usize>,
     /// True when a TOC page yielded far fewer parsed entries than candidate
     /// lines (multi-column / tab-layout TOCs that plain text can only half
     /// parse) — the layout path should be used instead.
@@ -437,8 +441,26 @@ fn plain_scan(
         })
         .map(|(page, _)| *page)
         .collect();
+    let candidate_pages: Vec<usize> = (1..=max_scan)
+        .filter(|&page| {
+            let Some(p) = scored.iter().find(|(pg, _)| *pg == page).map(|(_, p)| p) else { return false };
+            let near_marker = marker_pages.iter().any(|&m| m.abs_diff(page) <= 2);
+            // The marker page is always a candidate; other pages need at least
+            // two parseable entries (a garbled TOC continuation page keeps a
+            // few). A single spurious entry (a dense front-matter line ending
+            // in a digit) must not pull that expensive page into the layout
+            // scan — one such page costs ~400ms to extract.
+            near_marker && (p.marker || p.entries.len() >= 2)
+        })
+        .collect();
     if toc_pages.is_empty() {
-        return PlainScan { entries: Vec::new(), pages: Vec::new(), markers: marker_pages, poor_coverage: false };
+        return PlainScan {
+            entries: Vec::new(),
+            pages: Vec::new(),
+            markers: marker_pages,
+            candidates: candidate_pages,
+            poor_coverage: false,
+        };
     }
 
     // Coverage check: a multi-column / tab-layout TOC (语文) has many candidate
@@ -471,9 +493,9 @@ fn plain_scan(
         scored.iter().find(|(page, _)| *page == p).map(|(_, s)| s.marker).unwrap_or(false)
     });
     if entries.len() >= 4 && (marker_seen || entries.len() >= 6) {
-        PlainScan { entries, pages: toc_pages, markers: marker_pages, poor_coverage }
+        PlainScan { entries, pages: toc_pages, markers: marker_pages, candidates: candidate_pages, poor_coverage }
     } else {
-        PlainScan { entries: Vec::new(), pages: Vec::new(), markers: marker_pages, poor_coverage }
+        PlainScan { entries: Vec::new(), pages: Vec::new(), markers: marker_pages, candidates: candidate_pages, poor_coverage }
     }
 }
 
@@ -878,17 +900,21 @@ struct TocPages {
 /// few entries, or has many gap-separated right-aligned page runs. Pages next
 /// to a marker page with at least a few runs are added too — multi-page TOCs
 /// (especially two-column ones) often have fewer runs on continuation pages.
-fn find_toc_pages(doc: &PdfDocument, total_pages: usize, marker_hint: Option<&[usize]>) -> TocPages {
+fn find_toc_pages(doc: &PdfDocument, total_pages: usize, candidates: &[usize], markers: &[usize]) -> TocPages {
     let max_scan = total_pages.min(20);
-    // Only pages near a plain-text 目录/Contents marker can be printed-TOC
-    // pages; extracting layout geometry for the whole front matter is the main
-    // cost of the heuristic path (~150ms/page). Without a marker hint (marker
-    // glyphs themselves garbled) fall back to scanning all front-matter pages.
-    let candidates: Vec<usize> = match marker_hint {
-        Some(markers) if !markers.is_empty() => (1..=max_scan)
+    // Layout extraction is the dominant cost of the heuristic path
+    // (~75ms/page), so extract geometry only for pages that plain text already
+    // suggested are TOC pages: pages near a 目录/Contents marker that carry a
+    // marker or at least one parseable entry. Fall back to the whole marker
+    // ±2 window, then to all front-matter pages, when plain found nothing.
+    let candidates: Vec<usize> = if !candidates.is_empty() {
+        candidates.to_vec()
+    } else if !markers.is_empty() {
+        (1..=max_scan)
             .filter(|&page| markers.iter().any(|&m| m.abs_diff(page) <= 2))
-            .collect(),
-        _ => (1..=max_scan).collect(),
+            .collect()
+    } else {
+        (1..=max_scan).collect()
     };
     let mut info: Vec<(usize, bool, bool, usize)> = Vec::new(); // (page, marker, is_toc, runs)
     let mut lines: HashMap<usize, Vec<RawLine>> = HashMap::new();
@@ -980,17 +1006,38 @@ fn raw_lines_from_page(doc: &PdfDocument, page_num: usize) -> Vec<RawLine> {
         if words.is_empty() {
             continue;
         }
-        let text = words.iter().map(|w| w.text.as_str()).collect::<Vec<_>>().join(" ");
-        out.push(RawLine {
-            text,
-            x: l.bbox.x,
-            y: l.bbox.y,
-            width: l.bbox.width,
-            font_size: fs / n as f32,
-            words,
-        });
+        // Two-column TOCs place the left and right entries on one baseline
+        // separated by a large horizontal gap. Split the word stream there —
+        // but only when the words after the gap form a whole entry (≥2 words);
+        // a single trailing word is a right-aligned page number that belongs to
+        // the entry before it.
+        let mut start = 0usize;
+        for i in 1..words.len() {
+            let gap = words[i].x - (words[i - 1].x + words[i - 1].width);
+            if gap > 25.0 && words.len() - i >= 2 {
+                push_line(&mut out, &words[start..i], l.bbox.y, fs / n as f32);
+                start = i;
+            }
+        }
+        push_line(&mut out, &words[start..], l.bbox.y, fs / n as f32);
     }
     merge_same_baseline(out)
+}
+
+/// Build a RawLine from a word slice (used after splitting same-baseline
+/// two-column word streams).
+fn push_line(out: &mut Vec<RawLine>, words: &[RawWord], y: f32, font_size: f32) {
+    let x = words.first().map(|w| w.x).unwrap_or(0.0);
+    let right = words.iter().map(|w| w.x + w.width).fold(0.0f32, f32::max);
+    let text = words.iter().map(|w| w.text.as_str()).collect::<Vec<_>>().join(" ");
+    out.push(RawLine {
+        text,
+        x,
+        y,
+        width: right - x,
+        font_size,
+        words: words.to_vec(),
+    });
 }
 
 fn merge_same_baseline(mut lines: Vec<RawLine>) -> Vec<RawLine> {
@@ -1007,6 +1054,17 @@ fn merge_same_baseline(mut lines: Vec<RawLine>) -> Vec<RawLine> {
     for l in lines {
         if let Some(last) = out.last_mut() {
             if (l.y - last.y).abs() <= 3.0 {
+                // Two-column TOCs place the left and right entries on the SAME
+                // baseline with a large horizontal gap. A multi-word fragment
+                // after such a gap is a second entry, not a wrapped piece of
+                // the first — only merge single-token fragments (a right-
+                // aligned page number, or a split title word).
+                let gap = l.x - last.words.last().map(|w| w.x + w.width).unwrap_or(last.x);
+                let is_column = gap > 20.0 && l.words.len() >= 2;
+                if is_column {
+                    out.push(l);
+                    continue;
+                }
                 // Fragments on one baseline (title + right-aligned page run) may
                 // arrive with slightly different y values; re-sort by x so the
                 // page run is always the final word.
@@ -1067,6 +1125,7 @@ fn parse_toc_pages(toc: &TocPages, total_pages: usize) -> Vec<RawEntry> {
         if lines.is_empty() {
             continue;
         }
+
         let page_width = lines.iter().map(|l| l.x + l.width).fold(0.0f32, f32::max);
         let med = median_font(&entries);
         for l in lines {
@@ -1476,6 +1535,12 @@ fn entry_is_junk(title: &str) -> bool {
     if !title_has_text(title) {
         return true;
     }
+    // Math/formula noise: after the numbering prefix the title must contain a
+    // real word (≥2 consecutive letters/CJK), not just operators and digits
+    // ("2.2 + + 2.6 = = 2 （个）" is a stray expression, not a heading).
+    if !has_wordish(&strip_numbering_prefix(title)) {
+        return true;
+    }
     const COLOPHON: &[&str] = &[
         "ISBN", "书号", "印 张", "印张", "开 本", "开本", "定价", "责任编辑", "出版",
         "网 址", "版权所有", "毫米", "版次", "印次", "字数", "图 书在版编目", "绿色印刷",
@@ -1486,6 +1551,34 @@ fn entry_is_junk(title: &str) -> bool {
 /// Does the title carry readable text (CJK or ASCII letters)?
 fn title_has_text(title: &str) -> bool {
     title.chars().any(|c| is_cjk_char(c) || c.is_ascii_alphabetic())
+}
+
+/// True when `s` is a real title word, as opposed to a math/formula line of
+/// digits/operators. Uses the ratio of content characters (CJK ideographs +
+/// ASCII letters) to non-space characters: a title such as "时、分、秒",
+/// "比" or "圆" is real even though punctuation/brevity breaks naive
+/// consecutive-run checks, while "2.2 + + 2.6 = = 2 （个）9.9" has only one
+/// ideograph among many operators and is rejected.
+fn has_wordish(s: &str) -> bool {
+    let mut content = 0usize;
+    let mut total = 0usize;
+    for c in s.chars() {
+        if c.is_whitespace() {
+            continue;
+        }
+        total += 1;
+        if c.is_ascii_alphabetic() || is_cjk_ideograph(c) {
+            content += 1;
+        }
+    }
+    content >= 1 && content * 2 >= total
+}
+
+/// CJK ideographs proper — excludes CJK punctuation (、，。（）《》"") and
+/// full-width forms so those do not count as title content.
+fn is_cjk_ideograph(c: char) -> bool {
+    matches!(c,
+        '\u{4E00}'..='\u{9FFF}' | '\u{3400}'..='\u{4DBF}' | '\u{F900}'..='\u{FAFF}')
 }
 
 fn is_generic_label(t: &str) -> bool {
@@ -2077,12 +2170,25 @@ fn is_unit_word(s: &str) -> bool {
 
 /// Clean a raw title: trim punctuation, drop leading dot-leader runs and
 /// garbage tokens.
+/// Dot-leader glyphs (ASCII period, middle dot, ellipses).
+fn is_leader_char(c: char) -> bool {
+    matches!(c, '.' | '·' | '…' | '⋯')
+}
+
 fn clean_title(t: &str) -> String {
+    // Drop whole dot-leader tokens ("⋯⋯⋯⋯") from anywhere in the title, then
+    // trim any leader glyphs glued to the ends ("第二课 竖⋯" → "第二课 竖").
+    let t = t
+        .split_whitespace()
+        .filter(|tok| !tok.chars().all(is_leader_char))
+        .collect::<Vec<_>>()
+        .join(" ");
     let t = t
         .trim()
-        .trim_start_matches(['.', '·', '…'])
+        .trim_start_matches(is_leader_char)
         .trim()
-        .trim_end_matches(['.', '·', '…', ':', '，', ','])
+        .trim_end_matches(is_leader_char)
+        .trim_end_matches([':', '，', ','])
         .trim();
     strip_garbage_prefix(t)
 }
@@ -2373,6 +2479,7 @@ mod tests {
             ],
             pages: vec![4],
             markers: vec![4],
+            candidates: vec![4],
             poor_coverage: false,
         };
         assert!(plain_is_acceptable(&clean));
@@ -2387,6 +2494,7 @@ mod tests {
             ],
             pages: vec![5],
             markers: vec![5],
+            candidates: vec![5],
             poor_coverage: false,
         };
         assert!(!plain_is_acceptable(&garbled));
@@ -2400,6 +2508,7 @@ mod tests {
             ],
             pages: vec![5],
             markers: vec![5],
+            candidates: vec![5],
             poor_coverage: false,
         };
         assert!(plain_is_acceptable(&numeric));

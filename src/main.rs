@@ -4,14 +4,13 @@ use std::time::Instant;
 use std::collections::HashSet;
 use clap::{Parser, CommandFactory};
 
-mod cli;
-mod config;
-mod pdf;
-mod index;
-mod search;
-mod formatter;
-mod interactive;
-mod toc;
+use paperreader::cli;
+use paperreader::pdf;
+use paperreader::index;
+use paperreader::search;
+use paperreader::formatter;
+use paperreader::interactive;
+use paperreader::toc;
 
 use cli::Cli;
 use search::{search_txt, find_texts};

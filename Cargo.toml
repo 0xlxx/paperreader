@@ -21,3 +21,10 @@ tempfile = "3"
 lto = true
 strip = true
 codegen-units = 1
+
+[dev-dependencies]
+criterion = "0.8.2"
+
+[[bench]]
+name = "toc_bench"
+harness = false
