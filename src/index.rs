@@ -109,7 +109,7 @@ pub fn index_one_doc(doc_path: &Path) {
         total_pages = page_count;
         for page_idx in 0..page_count {
             let page_num = page_idx + 1;
-            let text = doc.extract_text(page_idx).unwrap_or_default();
+            let text = crate::pdf::safe_extract_text(&doc, page_idx);
             if !text.trim().is_empty() {
                 indexed_pages += 1;
                 indexed_words += text.split_whitespace().count();

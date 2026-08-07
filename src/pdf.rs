@@ -1,11 +1,30 @@
 use std::path::{Path, PathBuf};
 use std::fs;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use pdf_oxide::PdfDocument;
 use walkdir::WalkDir;
 use tempfile::tempdir;
 
 use crate::search::{search_via_ripgrep, SearchResult};
 use crate::index::DocumentMeta;
+
+/// Safely extract text from a PDF page, catching panics from pdf_oxide.
+/// pdf_oxide has known bugs where sort_by closures using f32::partial_cmp()
+/// panic with "user-provided comparison function does not correctly implement
+/// a total order" when encountering NaN coordinates in malformed PDFs.
+pub(crate) fn safe_extract_text(doc: &PdfDocument, page_idx: usize) -> String {
+    match catch_unwind(AssertUnwindSafe(|| doc.extract_text(page_idx))) {
+        Ok(Ok(text)) => text,
+        Ok(Err(e)) => {
+            eprintln!("\n  Warning: extract_text error on page {}: {}", page_idx + 1, e);
+            String::new()
+        }
+        Err(_panic) => {
+            eprintln!("\n  Warning: pdf_oxide panicked on page {} (NaN coordinates in PDF), skipping page text", page_idx + 1);
+            String::new()
+        }
+    }
+}
 
 /// 递归查找指定目录下的所有 PDF 文件，支持按文件名过滤
 pub fn find_pdfs(directory: &Path, name_filter: Option<&str>) -> Vec<PathBuf> {
@@ -37,7 +56,9 @@ pub fn extract_page(path: &Path, page_num: usize) -> Option<String> {
         return None;
     }
     // pdf_oxide 内部的 page index 是从 0 开始的
-    doc.extract_text(page_num - 1).ok()
+    let text = safe_extract_text(&doc, page_num - 1);
+    if text.is_empty() { return None; }
+    Some(text)
 }
 
 /// 直接搜索单个 PDF 文件
@@ -80,7 +101,7 @@ pub fn search_pdf(
         if !label.is_empty() {
             eprint!("\r  {}  extracting page {}/{}", label, page_num, page_count);
         }
-        let text = doc.extract_text(page_idx).unwrap_or_default();
+        let text = safe_extract_text(&doc, page_idx);
         let page_file = temp_dir.path().join(format!("page_{:04}.txt", page_num));
         if let Err(e) = fs::write(&page_file, text) {
             eprintln!("\nWarning: failed to write temp file {:?}: {}", page_file, e);

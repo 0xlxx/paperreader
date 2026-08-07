@@ -163,23 +163,25 @@ fn main() {
 
     // 2.5 TOC
     if args.toc {
-        if pdfs.is_empty() { exit_no_docs(); }
+        if pdfs.is_empty() {
+            exit_no_docs();
+        }
         let target = &pdfs[0];
-        let total_pages = page_count(target);
         let _toc_start = Instant::now();
-        let cached = crate::index::read_valid_meta(target).is_some();
-        eprintln!("Scanning {} pages{} for TOC patterns...",
-            if cached { total_pages.to_string() } else { format!("~{}", (total_pages / 25).max(5) + 10) },
-            if cached { " (index cache)" } else { " (sampled)" });
-        let entries = toc::detect_toc(target, total_pages);
+        let report = toc::detect_toc(target, args.toc_heuristic);
         eprintln!("TOC scan completed in {:.1}s", _toc_start.elapsed().as_secs_f64());
         if args.json {
-            println!("{}", serde_json::to_string_pretty(&serde_json::json!({"file": target.to_string_lossy(), "entries": entries})).unwrap());
-        } else if entries.is_empty() {
-            println!("No TOC entries detected in {} pages.", total_pages);
+            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                "file": target.to_string_lossy(),
+                "total_pages": report.total_pages,
+                "source": report.source,
+                "entries": report.entries,
+            })).unwrap());
+        } else if report.entries.is_empty() {
+            println!("No TOC entries detected in {} pages.", report.total_pages);
         } else {
-            println!("\n  Table of Contents ({} entries):\n", entries.len());
-            for entry in &entries {
+            println!("\n  Table of Contents ({} entries, from {}):\n", report.entries.len(), report.source);
+            for entry in &report.entries {
                 let indent = "  ".repeat(entry.level.min(3));
                 println!("{}{}  (p{})", indent, entry.title, entry.page);
             }

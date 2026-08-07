@@ -81,9 +81,13 @@ pub struct Cli {
     #[arg(long)]
     pub no_index: bool,
 
-    /// Extract table of contents (scans first ~20 pages for chapter headings and dot-leader patterns)
+    /// Extract table of contents (PDF embedded outlines first, fallback to heuristics)
     #[arg(long)]
     pub toc: bool,
+
+    /// Force heuristic TOC detection even when PDF outlines are available
+    #[arg(long)]
+    pub toc_heuristic: bool,
 
     /// Check CJK text extraction quality by sampling random pages and reporting character coverage
     #[arg(long)]

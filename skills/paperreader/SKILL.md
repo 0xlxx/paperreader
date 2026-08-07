@@ -75,13 +75,22 @@ paperreader --case-sensitive "Query"       # Case-sensitive
 ## Table of contents
 
 ```bash
-paperreader --file "paper.pdf" --toc        # Extract TOC (PDF outlines first, fallback to heuristics)
-paperreader --file "paper.pdf" --toc --json # Structured JSON with page numbers and hierarchy
+paperreader --file "paper.pdf" --toc              # Extract TOC (outlines first, then heuristics)
+paperreader --file "paper.pdf" --toc --json       # Structured JSON: source, total_pages, entries
+paperreader --file "paper.pdf" --toc --toc-heuristic  # Force heuristics, skip embedded outlines
 ```
 
-Extraction priority: (1) PDF embedded outlines — the same tree PDF readers use for the sidebar, fast and zero false positives; (2) heuristic detection from printed TOC pages. When the document is indexed, all pages are scanned via disk cache (~0.1s); otherwise samples ~25 pages.
+Extraction priority (aligned with ISO 32000-1):
 
-JSON output includes hierarchy levels: `0` = part/title, `1` = chapter, `2` = section, `3` = subsection.
+1. **PDF embedded outlines** (`/Outlines`, §12.3.3) — the exact tree PDF readers render in the sidebar; fast and zero false positives. Handles UTF-16/UTF-8/PDFDocEncoding titles, `/Dest`, GoTo actions, and named destinations.
+2. **Printed TOC pages** — detects the 目录/Contents page(s), then parses entries. A fast plain-text pass (dot leaders, right-aligned page numbers, wrapped-title continuations, multi-column grid TOCs) covers most textbooks in ~0.02s; when plain text is garbled (broken ToUnicode CMaps, interleaved page numbers), a layout-aware pass uses word geometry (right-aligned page runs, indentation, font size) on only the marker page ±2 pages.
+3. **Heading scan** — last resort: scan (sampled) pages for strong chapter/section heading patterns.
+
+Page numbers are reported as **physical 1-indexed pages** (usable with `--extract-page`/`--extract-range`): each title is located in the body (via the on-disk index cache when available, else a sampled scan), which derives the median front-matter offset between printed and physical page numbers and corrects every entry. Indexed documents scan the whole body in ~0.1s; unindexed documents sample pages.
+
+The whole extraction opens the PDF **once** (page count + outline + heuristics share the same document).
+
+JSON output: `source` is `"outlines" | "printed_toc" | "heading_scan"`; each entry has `page`, `title`, `level` (`0` = part/unit, `1` = chapter, `2` = section, `3` = subsection).
 
 ## List & inspect
 
