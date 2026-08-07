@@ -253,23 +253,51 @@ fn plain_is_acceptable(plain: &PlainScan) -> bool {
     if plain.entries.len() < 4 {
         return false;
     }
+    // Half-parsed multi-column TOCs are better handled by the layout path.
+    if plain.poor_coverage {
+        return false;
+    }
     let readable = plain.entries.iter().filter(|e| title_has_text(&e.title)).count();
     if readable * 2 < plain.entries.len() {
         return false;
     }
-    // A title that still contains digits after its numbering prefix is
-    // stripped is a garble signal (broken ToUnicode CMap interleaves page
-    // numbers into titles, e.g. "396~10的认识和加减法5" in 数学一年级上册).
-    // Legitimate numeric titles such as "1 负数" / "2 百分数（二）" strip
-    // cleanly to "负数" / "百分数（二）", so ANY remaining digit means the
-    // plain text is unreliable — fall through to the layout path, which can
-    // recover the true structure from word geometry.
-    let garbled = plain
-        .entries
-        .iter()
-        .filter(|e| strip_numbering_prefix(&e.title).chars().any(|c| c.is_ascii_digit()))
-        .count();
-    garbled == 0
+    // A broken ToUnicode CMap glues page numbers into titles ("认识钟表847",
+    // "396~10的认识和加减法5" in 数学一年级上册). The signature is digits at
+    // the END of the title (a page number glued on) or a long leading digit
+    // run before the real title ("888 20以内的进位加法") — NOT legitimate
+    // mid-title numbers like "3D" in "Foundations of 3D Rendering". Any such
+    // garble means plain text is unreliable — fall through to the layout path,
+    // which can recover the true structure from word geometry.
+    let garbled = plain.entries.iter().filter(|e| title_is_garbled(&e.title)).count();
+    if garbled > 0 {
+        return false;
+    }
+    // Printed page numbers must be monotonically non-decreasing in TOC order.
+    // A decrease ("时、分、秒"→p21, "测量"→p3) means page numbers were glued
+    // to the wrong titles — reject so the layout path is used.
+    let mut last_page = 0usize;
+    for e in &plain.entries {
+        if let Some(p) = e.printed_page {
+            if p < last_page {
+                return false;
+            }
+            last_page = p;
+        }
+    }
+    true
+}
+
+/// True when an entry title shows the ToUnicode-garble signature: digits glued
+/// to the end (a page number) or a leading digit run of 3+ before the title.
+fn title_is_garbled(title: &str) -> bool {
+    let t = title.trim();
+    if t.is_empty() {
+        return false;
+    }
+    if t.chars().last().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+        return true;
+    }
+    t.chars().take_while(|c| c.is_ascii_digit()).count() >= 3
 }
 
 /// Load every page's extracted text from the on-disk index cache, once.
@@ -331,6 +359,10 @@ struct PlainScan {
     /// rejected) — used to seed the layout scan so it only extracts geometry
     /// for pages near the marker instead of the whole front matter.
     markers: Vec<usize>,
+    /// True when a TOC page yielded far fewer parsed entries than candidate
+    /// lines (multi-column / tab-layout TOCs that plain text can only half
+    /// parse) — the layout path should be used instead.
+    poor_coverage: bool,
 }
 
 /// Scan the first pages of plain text for a printed TOC.
@@ -363,8 +395,13 @@ fn plain_scan(
         let Some(text) = page_text(cache, doc, path, page) else { continue };
         let parsed = plain_parse_page(&text);
         if cache.is_none() && stop_after.is_none() {
-            let numbered = parsed.entries.iter().filter(|e| e.printed_page.is_some()).count();
-            if parsed.marker && numbered >= 3 {
+            let numbered = parsed
+                .entries
+                .iter()
+                .filter(|e| e.printed_page.map_or(false, |pp| pp >= 1 && pp <= total_pages.saturating_add(20)))
+                .count();
+            let structured = parsed.entries.iter().filter(|e| e.has_numbering).count();
+            if parsed.marker && (numbered >= 3 || structured >= 3) {
                 stop_after = Some((page + 2).min(max_scan));
             }
         }
@@ -378,20 +415,40 @@ fn plain_scan(
     let toc_pages: Vec<usize> = scored
         .iter()
         .filter(|(page, p)| {
-            let numbered = p.entries.iter().filter(|e| e.printed_page.is_some()).count();
+            // Only *plausible* printed pages count — a copyright page whose
+            // "ISBN 9781032443065" parses as a trailing number must not look
+            // like a TOC page.
+            let numbered = p
+                .entries
+                .iter()
+                .filter(|e| e.printed_page.map_or(false, |pp| pp >= 1 && pp <= total_pages.saturating_add(20)))
+                .count();
             // A TOC page must be anchored to the 目录/Contents marker: the marker
             // page itself, or a continuation page within ±2 (multi-page TOCs).
             // Bare `numbered >= 4` is NOT enough — math-textbook body pages are
             // full of lines ending in digits and would flood the TOC with
-            // body sentences (数学六年级下册 page 8+).
-            numbered >= 3
-                && (p.marker || marker_pages.iter().any(|&m| m.abs_diff(*page) <= 2))
+            // body sentences (数学六年级下册 page 8+). Entries may also carry a
+            // numbering prefix without a readable page number (tech-book TOCs
+            // whose page column is not in the text layer, e.g. GEA Vol 2), so a
+            // page with 3+ structurally-numbered entries counts too.
+            let anchored = p.marker || marker_pages.iter().any(|&m| m.abs_diff(*page) <= 2);
+            let structured = p.entries.iter().filter(|e| e.has_numbering).count();
+            anchored && (numbered >= 3 || structured >= 3)
         })
         .map(|(page, _)| *page)
         .collect();
     if toc_pages.is_empty() {
-        return PlainScan { entries: Vec::new(), pages: Vec::new(), markers: marker_pages };
+        return PlainScan { entries: Vec::new(), pages: Vec::new(), markers: marker_pages, poor_coverage: false };
     }
+
+    // Coverage check: a multi-column / tab-layout TOC (语文) has many candidate
+    // lines that plain text can only half parse. If any TOC page yields far
+    // fewer entries than candidates, the layout path should recover the rest.
+    let poor_coverage = scored.iter().any(|(page, p)| {
+        toc_pages.contains(page)
+            && p.candidates >= 4
+            && p.entries.len() * 10 < p.candidates * 6
+    });
 
     let mut entries: Vec<RawEntry> = Vec::new();
     for (page, parsed) in &scored {
@@ -414,15 +471,19 @@ fn plain_scan(
         scored.iter().find(|(page, _)| *page == p).map(|(_, s)| s.marker).unwrap_or(false)
     });
     if entries.len() >= 4 && (marker_seen || entries.len() >= 6) {
-        PlainScan { entries, pages: toc_pages, markers: marker_pages }
+        PlainScan { entries, pages: toc_pages, markers: marker_pages, poor_coverage }
     } else {
-        PlainScan { entries: Vec::new(), pages: Vec::new(), markers: marker_pages }
+        PlainScan { entries: Vec::new(), pages: Vec::new(), markers: marker_pages, poor_coverage }
     }
 }
 
 struct PlainPage {
     marker: bool,
     entries: Vec<RawEntry>,
+    /// Number of lines that look like TOC entries (non-empty, non-marker,
+    /// readable text). Compared against parsed entries to detect multi-column
+    /// or otherwise half-parsed TOCs where plain text alone is insufficient.
+    candidates: usize,
 }
 
 /// Parse one page of plain text into TOC entries (dot leaders, trailing page
@@ -436,6 +497,7 @@ fn plain_parse_page(text: &str) -> PlainPage {
     let mut marker = false;
     let mut entries: Vec<RawEntry> = Vec::new();
     let mut last_has_numbering = false;
+    let mut candidates = 0usize;
 
     for line in text.lines() {
         let raw = line.trim_end();
@@ -447,7 +509,14 @@ fn plain_parse_page(text: &str) -> PlainPage {
             marker = true;
             continue;
         }
+        let has_text = trimmed.chars().any(|c| is_cjk_char(c) || c.is_ascii_alphabetic());
+        if has_text && trimmed.chars().count() >= 2 {
+            candidates += 1;
+        }
         let indented = raw.starts_with(char::is_whitespace) && raw.len() > raw.trim_start().len();
+        // Collapse extraction spacing ("第 一 章", "人 口") so heading
+        // patterns and continuations match the true text.
+        let norm = normalize_title_spacing(trimmed);
 
         if let Some((title, printed)) = plain_line_page(raw) {
             let title = clean_title(&normalize_title_spacing(&title));
@@ -492,15 +561,21 @@ fn plain_parse_page(text: &str) -> PlainPage {
             && entries.last().unwrap().printed_page.is_none()
             && entries.last().unwrap().page.is_none()
             && last_has_numbering
+            && try_chapter_heading(&norm).is_none()
+            && match_space_numbered_chapter(&norm).is_none()
         {
-            // Continuation without a page number (e.g. a wrapped unit title).
+            // Continuation without a page number (e.g. a wrapped unit title) —
+            // but only when the line is not itself a fresh numbered entry
+            // ("11.1 The Rendering Problem" must start a new row, not extend
+            // "11 Rendering").
             let last = entries.last_mut().unwrap();
-            append_title(&mut last.title, trimmed);
-        } else if !indented {
+            append_title(&mut last.title, &norm);
+        } else if !indented || try_chapter_heading(&norm).is_some() || match_space_numbered_chapter(&norm).is_some() {
             // A heading-like line without a page number (e.g. a unit title whose
             // page number is unreadable, or 附录 whose page follows on the next
-            // line): keep it; resolution happens later.
-            if let Some((title, level)) = try_chapter_heading(trimmed) {
+            // line): keep it; resolution happens later. Indented lines count too
+            // when they carry a strong heading pattern (" 第 一 章").
+            if let Some((title, level)) = try_chapter_heading(&norm) {
                 entries.push(RawEntry {
                     title,
                     printed_page: None,
@@ -511,9 +586,23 @@ fn plain_parse_page(text: &str) -> PlainPage {
                     font_size: 0.0,
                 });
                 last_has_numbering = true;
-            } else if let Some(level) = level_from_keywords(trimmed) {
+            } else if let Some((title, level)) = match_space_numbered_chapter(&norm) {
+                // "11 Rendering" — digit + space + title, no period; common in
+                // tech-book TOCs (Game Engine Architecture). Allowed in the
+                // marker-anchored TOC context even for a 1-word title.
                 entries.push(RawEntry {
-                    title: trimmed.to_string(),
+                    title,
+                    printed_page: None,
+                    page: None,
+                    level,
+                    has_numbering: true,
+                    x: 0.0,
+                    font_size: 0.0,
+                });
+                last_has_numbering = true;
+            } else if let Some(level) = level_from_keywords(&norm) {
+                entries.push(RawEntry {
+                    title: norm.clone(),
                     printed_page: None,
                     page: None,
                     level,
@@ -551,7 +640,7 @@ fn plain_parse_page(text: &str) -> PlainPage {
         }
     }
 
-    PlainPage { marker, entries }
+    PlainPage { marker, entries, candidates }
 }
 
 /// Split a line into several (title, page) pairs when it contains multiple
@@ -651,6 +740,10 @@ fn has_internal_dot_leader(s: &str) -> bool {
 /// extracted *before* the title ("28第6课 标题.....").
 fn plain_line_page(line: &str) -> Option<(String, usize)> {
     let t = line.trim_end();
+    // Some TOCs put the page number *before* the title after a dot leader:
+    // "……43第10课 《凡尔赛条约》和《九国公约》" — strip the leading dots so
+    // the leading-page parser sees "43第10课 …".
+    let t = t.trim_start_matches(['.', '·', '…']).trim_start();
     if let Some((title, page)) = split_leading_page(t) {
         return Some((title, page));
     }
@@ -706,13 +799,16 @@ fn split_leading_page(line: &str) -> Option<(String, usize)> {
     let rest = t[digit_len..].trim_start();
     let lower = rest.to_lowercase();
     let heading_start = rest.starts_with('第')
+        || rest.chars().next().map(is_cjk_char).unwrap_or(false)
         || lower.starts_with("chapter ")
         || lower.starts_with("appendix ")
         || lower.starts_with("part ");
     if !heading_start {
         return None;
     }
-    let (title, _) = split_on_dot_leader(rest)?;
+    // The title is everything after the page number; a trailing dot leader is
+    // optional ("24第一节 乡村和城镇空间结构" has none).
+    let (title, _) = split_on_dot_leader(rest).unwrap_or_else(|| (rest.to_string(), String::new()));
     let page = parse_page_text(&t[..digit_len])?;
     if page > 0 {
         Some((title, page))
@@ -1085,7 +1181,9 @@ fn median_font(entries: &[RawEntry]) -> f32 {
 struct PageTexts<'a> {
     doc: &'a PdfDocument,
     cache: Option<&'a Vec<Option<String>>>,
-    local: HashMap<usize, String>,
+    /// Raw + whitespace-free page text, extracted at most once per page when
+    /// there is no index cache.
+    local: HashMap<usize, (String, String)>,
 }
 
 impl<'a> PageTexts<'a> {
@@ -1093,20 +1191,33 @@ impl<'a> PageTexts<'a> {
         PageTexts { doc, cache, local: HashMap::new() }
     }
 
-    /// Whitespace-free text for a page, extracting once if not cached.
-    fn compact(&mut self, page: usize) -> Option<String> {
+    fn raw(&mut self, page: usize) -> Option<String> {
         if let Some(c) = self.cache {
-            return c.get(page - 1).cloned().flatten().map(|t| compact_text(&t));
+            return c.get(page - 1).cloned().flatten();
         }
-        if let Some(t) = self.local.get(&page) {
-            return Some(t.clone());
+        if let Some((raw, _)) = self.local.get(&page) {
+            return Some(raw.clone());
         }
         let t = crate::pdf::safe_extract_text(self.doc, page - 1);
         if t.trim().is_empty() {
             return None;
         }
         let c = compact_text(&t);
-        self.local.insert(page, c.clone());
+        self.local.insert(page, (t.clone(), c));
+        Some(t)
+    }
+
+    /// Whitespace-free text for a page, extracting once if not cached.
+    fn compact(&mut self, page: usize) -> Option<String> {
+        if let Some(c) = self.cache {
+            return c.get(page - 1).cloned().flatten().map(|t| compact_text(&t));
+        }
+        if let Some((_, c)) = self.local.get(&page) {
+            return Some(c.clone());
+        }
+        let raw = self.raw(page)?;
+        let c = compact_text(&raw);
+        self.local.insert(page, (raw, c.clone()));
         Some(c)
     }
 
@@ -1155,10 +1266,42 @@ fn resolve_pages(
         // page — so the full-body scan can stop early.
         let mut texts = PageTexts::new(doc, cache);
 
+        // Pass 0: standalone-line match. Tech-book chapter openers often put the
+        // number and the title on separate lines ("15" then "Audio"), so the
+        // title appears as a line by itself; substring search would land on an
+        // incidental mention (the word "audio" inside a physics paragraph).
+        let mut line_keys: Vec<Option<String>> = entries
+            .iter()
+            .map(|e| {
+                let t = strip_garbage_prefix(&strip_numbering_prefix(&e.title)).trim().to_string();
+                if t.chars().count() >= 4 && t.chars().any(|c| c.is_alphabetic() || is_cjk_char(c)) {
+                    Some(t)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
         // Pass 1: exact (whitespace-insensitive) title match.
         let need_offset_pairs = if cache.is_some() { usize::MAX } else { 4 };
         let mut offset_pairs = 0usize;
         for page in &scan_pages {
+            // Standalone-line matches first (chapter openers, "Audio").
+            if line_keys.iter().any(|k| k.is_some()) {
+                if let Some(text) = texts.raw(*page) {
+                    for (i, lk) in line_keys.iter_mut().enumerate() {
+                        if let Some(k) = lk {
+                            if text.lines().any(|l| l.trim() == k) {
+                                entries[i].page = Some(*page);
+                                *lk = None;
+                                if entries[i].printed_page.is_some() {
+                                    offset_pairs += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             let Some(text) = texts.compact(*page) else { continue };
             for (i, k) in keys.iter_mut().enumerate() {
                 if let Some(key) = k {
@@ -1206,12 +1349,20 @@ fn resolve_pages(
                 }
             }
         }
-        // Pass 3: heading-scan map for whatever remains — including entries
-        // whose search key was too short/generic to search reliably.
-        if entries.iter().any(|e| e.page.is_none()) {
+        // Pass 3: heading-scan map. It is the *authoritative* source for
+        // entries without a printed page number (their contains-search page can
+        // land on an incidental mention — e.g. "Post-Processing" appears on the
+        // chapter-12 opener before its real section): the map keys on full
+        // numbered body headings, which are exact. Entries with a printed page
+        // are resolved by printed + offset instead.
+        if entries.iter().any(|e| e.page.is_none() || e.printed_page.is_none()) {
             let map = heading_pages_after(doc, path, total_pages, last_toc, cache);
             for e in entries.iter_mut() {
-                if e.page.is_none() {
+                if e.printed_page.is_none() {
+                    if let Some(p) = map.get(&normalize_title(&e.title)) {
+                        e.page = Some(*p);
+                    }
+                } else if e.page.is_none() {
                     if let Some(p) = map.get(&normalize_title(&e.title)) {
                         e.page = Some(*p);
                     }
@@ -1282,22 +1433,30 @@ fn median_offset(entries: &[RawEntry]) -> Option<usize> {
 fn search_key(title: &str) -> Option<String> {
     let t = strip_numbering_prefix(title);
     let t = strip_garbage_prefix(&t);
-    let t = t.split_whitespace().collect::<Vec<_>>().join(" ");
+    // Body text is matched whitespace-insensitively (page_text_compact strips
+    // all whitespace, so "Lighting and Post-Processing" == "LightingandPost-Processing").
+    let t = compact_text(&t);
     if t.is_empty() {
         return None;
     }
     if is_generic_label(&t) {
         return None;
     }
-    // Short keys (e.g. "有理数", "附录") match incidental mentions across the
-    // body; let the heading map or the printed+offset path handle them instead.
-    if t.chars().count() < 4 {
-        return None;
+    if t.chars().count() >= 4 && t.chars().any(|c| c.is_alphabetic() || is_cjk_char(c)) {
+        return Some(t);
     }
-    if !t.chars().any(|c| c.is_alphabetic() || is_cjk_char(c)) {
-        return None;
+    // The stripped remainder is too short to search reliably ("第一章 人口" →
+    // "人口"), but the full normalized title ("第一章人口") is distinctive and
+    // matches the body chapter opener even when number and title sit on
+    // separate lines there.
+    let full = compact_text(&strip_garbage_prefix(title));
+    if full.chars().count() >= 4
+        && !is_generic_label(&full)
+        && full.chars().any(|c| c.is_alphabetic() || is_cjk_char(c))
+    {
+        return Some(full);
     }
-    Some(t)
+    None
 }
 
 fn prefix_key(key: &str) -> String {
@@ -1305,7 +1464,8 @@ fn prefix_key(key: &str) -> String {
     if cjk * 2 >= key.chars().count() {
         key.chars().take(10).collect()
     } else {
-        key.split_whitespace().take(3).collect::<Vec<_>>().join(" ")
+        // Key is already whitespace-free; a 3-token prefix is ~24 chars.
+        key.chars().take(24).collect()
     }
 }
 
@@ -1655,6 +1815,42 @@ fn match_numbered_chapter(line: &str) -> Option<(String, usize)> {
     Some((format!("{} {}", num, title), 1))
 }
 
+/// "11 Rendering" (digit + space + title, no period — common in tech-book
+/// TOCs such as Game Engine Architecture) → chapter (level 1). TOC-context
+/// only: unlike `match_numbered_chapter`, a 1-word title is allowed because
+/// the caller is already restricted to marker-anchored TOC pages.
+fn match_space_numbered_chapter(line: &str) -> Option<(String, usize)> {
+    let chars: Vec<char> = line.chars().collect();
+    let mut i = 0;
+    while i < chars.len() && chars[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i == 0 || i > 3 || i >= chars.len() || !chars[i].is_whitespace() {
+        return None;
+    }
+    let num: usize = chars[..i].iter().collect::<String>().parse().ok()?;
+    if num > 50 {
+        return None;
+    }
+    let title: String = chars[i..].iter().collect();
+    let title = title.trim().to_string();
+    let word_count = title.split_whitespace().count();
+    if title.len() < 3 || title.len() > 80 || word_count > 8 || word_count < 1 {
+        return None;
+    }
+    let first_char = title.chars().next().unwrap_or(' ');
+    if !first_char.is_ascii_uppercase() {
+        return None;
+    }
+    if title.contains("/*") || title.contains("*/") || title.contains('{') || title.contains('}') {
+        return None;
+    }
+    if !title.chars().any(|c| c.is_alphabetic() || is_cjk_char(c)) {
+        return None;
+    }
+    Some((format!("{} {}", num, title), 1))
+}
+
 /// "N.N Title" → level 2, "N.N.N Title" → level 3.
 fn match_numbered_section(line: &str) -> Option<(String, usize)> {
     let chars: Vec<char> = line.chars().collect();
@@ -1831,7 +2027,41 @@ fn normalize_title_spacing(title: &str) -> String {
             out.push(' ');
         }
     }
-    out
+    // Collapse extraction spacing between CJK characters ("人 口 分 布" →
+    // "人口分布"), but keep the space after known labels ("问题研究",
+    // "附录一", "第1课", …) so "问题研究 如何看待农民工现象" stays readable.
+    const KEEP_SPACE_LABELS: &[&str] = &[
+        "问题研究", "附录一", "附录二", "附录", "活动课", "数学活动", "阅读与思考",
+        "观察与猜想", "实验与探究", "信息技术应用", "探究与发现", "综合与实践",
+        "复习题", "练习", "小结", "写作", "综合性学习", "思考", "整理和复习",
+        "课外古诗词诵读", "名著导读", "单元", "章", "节", "课", "讲", "篇", "部分",
+        "专题", "模块", "框", "活动",
+    ];
+    let chars: Vec<char> = out.chars().collect();
+    let mut collapsed = String::with_capacity(out.len());
+    for (idx, c) in chars.iter().enumerate() {
+        if *c == ' ' && idx > 0 && idx + 1 < chars.len() {
+            let prev = chars[idx - 1];
+            let next = chars[idx + 1];
+            if is_cjk_char(prev) && is_cjk_char(next) {
+                let mut run_start = idx - 1;
+                while run_start > 0 && is_cjk_char(chars[run_start - 1]) {
+                    run_start -= 1;
+                }
+                let prev_run: String = chars[run_start..idx].iter().collect();
+                // Keep the space when the preceding CJK run ends with a known
+                // label ("第一节" → "节", "第三单元" → "单元", "问题研究").
+                let keep = KEEP_SPACE_LABELS
+                    .iter()
+                    .any(|l| prev_run == *l || (prev_run.ends_with(l) && prev_run.chars().count() - l.chars().count() <= 3));
+                if !keep {
+                    continue;
+                }
+            }
+        }
+        collapsed.push(*c);
+    }
+    collapsed
 }
 
 fn is_num_token(s: &str) -> bool {
@@ -1857,9 +2087,11 @@ fn clean_title(t: &str) -> String {
     strip_garbage_prefix(t)
 }
 
-/// Lowercased, whitespace-collapsed title used for dedup.
+/// Lowercased, whitespace-free title used for dedup and heading-map lookups.
+/// Whitespace is removed entirely (not just collapsed) so that extraction
+/// spacing drift ("第一章 人 口" vs "第一章 人口") does not break matching.
 fn normalize_title(title: &str) -> String {
-    title.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+    compact_text(title).to_lowercase()
 }
 
 fn is_cjk_char(c: char) -> bool {
@@ -2141,6 +2373,7 @@ mod tests {
             ],
             pages: vec![4],
             markers: vec![4],
+            poor_coverage: false,
         };
         assert!(plain_is_acceptable(&clean));
         // Broken ToUnicode glues page numbers into titles → rejected so the
@@ -2154,6 +2387,7 @@ mod tests {
             ],
             pages: vec![5],
             markers: vec![5],
+            poor_coverage: false,
         };
         assert!(!plain_is_acceptable(&garbled));
         // Legitimate numeric titles strip cleanly ("1 负数" → "负数").
@@ -2166,6 +2400,7 @@ mod tests {
             ],
             pages: vec![5],
             markers: vec![5],
+            poor_coverage: false,
         };
         assert!(plain_is_acceptable(&numeric));
     }
@@ -2181,5 +2416,14 @@ mod tests {
         let all = body_pages_to_scan(Some(&vec![None; 150]), 150, 6);
         assert_eq!(all.len(), 144);
         assert_eq!(all[0], 7);
+    }
+
+    #[test]
+    fn test_normalize_spacing_cjk() {
+        assert_eq!(normalize_title_spacing("第 一 节 人 口 分 布"), "第一节 人口分布");
+        assert_eq!(normalize_title_spacing("第 一 章 人 口"), "第一章 人口");
+        assert_eq!(normalize_title_spacing("问题研究 如何看待农民工现象"), "问题研究 如何看待农民工现象");
+        assert_eq!(normalize_title_spacing("人 口 分 布"), "人口分布");
+        assert_eq!(normalize_title_spacing("第1课 中华文明的起源"), "第1课 中华文明的起源");
     }
 }
