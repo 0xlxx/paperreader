@@ -78,16 +78,40 @@ fn main() {
     let mut pdfs = Vec::new();
     let mut txts = Vec::new();
 
-    if let Some(ref explicit_file) = args.file {
-        let file_path = Path::new(explicit_file).canonicalize().unwrap_or_else(|_| PathBuf::from(explicit_file));
+    // Single-document operations (--toc, --check, --extract-page/range, --head)
+    // accept the target file directly as a positional argument, e.g.
+    //   paperreader --toc 数学/高中/数学必修\ 第二册.pdf
+    let single_doc_op = args.toc
+        || args.check
+        || args.extract_page.is_some()
+        || args.extract_range.is_some()
+        || args.head.is_some();
+
+    let mut push_file = |path_str: &str, pdfs: &mut Vec<PathBuf>, txts: &mut Vec<PathBuf>| {
+        let file_path = Path::new(path_str).canonicalize().unwrap_or_else(|_| PathBuf::from(path_str));
         if !file_path.is_file() {
-            eprintln!("Error: '{}' is not a file or does not exist", explicit_file);
+            eprintln!("Error: '{}' is not a file or does not exist", path_str);
             std::process::exit(1);
         }
         if file_path.extension().map(|s| s.to_ascii_lowercase()) == Some(std::ffi::OsString::from("txt")) {
             txts.push(file_path);
         } else {
             pdfs.push(file_path);
+        }
+    };
+
+    if let Some(ref explicit_file) = args.file {
+        push_file(explicit_file, &mut pdfs, &mut txts);
+    } else if single_doc_op {
+        if let Some(ref q) = args.query {
+            push_file(q, &mut pdfs, &mut txts);
+        } else {
+            if !directory.is_dir() {
+                eprintln!("Error: '{}' is not a directory", directory.display());
+                std::process::exit(1);
+            }
+            pdfs = find_pdfs(&directory, args.files.as_deref());
+            txts = find_texts(&directory, args.files.as_deref());
         }
     } else {
         if !directory.is_dir() {
