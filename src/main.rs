@@ -87,7 +87,7 @@ fn main() {
         || args.extract_range.is_some()
         || args.head.is_some();
 
-    let mut push_file = |path_str: &str, pdfs: &mut Vec<PathBuf>, txts: &mut Vec<PathBuf>| {
+    let push_file = |path_str: &str, pdfs: &mut Vec<PathBuf>, txts: &mut Vec<PathBuf>| {
         let file_path = Path::new(path_str).canonicalize().unwrap_or_else(|_| PathBuf::from(path_str));
         if !file_path.is_file() {
             eprintln!("Error: '{}' is not a file or does not exist", path_str);
