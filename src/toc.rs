@@ -1976,6 +1976,16 @@ fn match_numbered_section(line: &str) -> Option<(String, usize)> {
     if !title.chars().any(|c| c.is_alphabetic() || is_cjk_char(c)) {
         return None;
     }
+    // Paper body text often starts with a measurement ("1.8 GHz Opteron PCs
+    // of 2GB RAM each…", "0.2 seconds per frame") — a real section heading is
+    // title-cased, so reject titles with more than two lowercase-initial words.
+    let lowercase_words: usize = title
+        .split_whitespace()
+        .filter(|w| w.starts_with(|c: char| c.is_ascii_lowercase()))
+        .count();
+    if lowercase_words > 2 {
+        return None;
+    }
     let level = (num.matches('.').count() + 1).min(3);
     Some((format!("{} {}", num, title), level))
 }
