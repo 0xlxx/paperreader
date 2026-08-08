@@ -852,23 +852,25 @@ fn plain_line_page(line: &str) -> Option<(String, usize)> {
     // "……43第10课 《凡尔赛条约》和《九国公约》" — strip the leading dots so
     // the leading-page parser sees "43第10课 …".
     let t = t.trim_start_matches(['.', '·', '…']).trim_start();
+    // Strip a trailing 页/頁 suffix so "标题42页" / "标题 第42页" parse like
+    // plain trailing page numbers.
+    let t = t.strip_suffix(['页', '頁']).unwrap_or(t);
     if let Some((title, page)) = split_leading_page(t) {
         return Some((title, page));
     }
     if let Some((title, page)) = split_dot_leader(t) {
         return Some((title, page));
     }
-    // Last whitespace-separated token is a number. Refuse when the "title"
-    // itself still contains dot leaders — that means the line holds several
-    // "title page" groups (grid TOCs), and split_multi_entries handles it.
+    // Last whitespace-separated token is a page reference ("42", "p.42",
+    // "第42页"). Refuse when the "title" itself still contains dot leaders —
+    // that means the line holds several "title page" groups (grid TOCs), and
+    // split_multi_entries handles it.
     if let Some(idx) = t.rfind(char::is_whitespace) {
         let last = t[idx..].trim();
-        if is_numeric_token(last) {
+        if let Some(page) = parse_page_ref(last) {
             let title = t[..idx].trim();
             if !title.is_empty() && !has_internal_dot_leader(title) {
-                if let Some(page) = parse_page_text(last) {
-                    return Some((title.to_string(), page));
-                }
+                return Some((title.to_string(), page));
             }
         }
     }
@@ -957,11 +959,12 @@ fn split_on_dot_leader(line: &str) -> Option<(String, String)> {
     Some((title, after))
 }
 
-/// Dot-leader split with a trailing page number: "text .... 42" → ("text", 42).
+/// Dot-leader split with a trailing page reference: "text .... 42" →
+/// ("text", 42); also accepts "p.42" / "42页" style references.
 fn split_dot_leader(line: &str) -> Option<(String, usize)> {
     let (title, after) = split_on_dot_leader(line)?;
     let page_str = after.split_whitespace().next().unwrap_or("");
-    let page = parse_page_text(page_str)?;
+    let page = parse_page_ref(page_str)?;
     if !title.is_empty() && page > 0 {
         Some((title, page))
     } else {
@@ -1733,6 +1736,17 @@ fn extract_headings(text: &str, page_num: usize) -> Vec<TocEntry> {
         if line.is_empty() || line.chars().count() > 120 {
             continue;
         }
+        // Collapse extraction spacing ("第 一 章 總綱" → "第一章 總綱") so the
+        // heading patterns match spaced Chinese numerals in the body too. Only
+        // CJK/space-heavy lines need it — English book pages (the common
+        // resolve_pages path) skip the allocation entirely.
+        let line_owned;
+        let line: &str = if line.contains('第') || (line.chars().any(is_cjk_char) && line.contains(char::is_whitespace)) {
+            line_owned = normalize_title_spacing(line);
+            &line_owned
+        } else {
+            line
+        };
         if let Some((title, level)) = try_chapter_heading(line) {
             if entry_is_junk(&title) {
                 continue; // garbled ToUnicode / chart-label noise
@@ -1800,7 +1814,11 @@ fn append_title(dst: &mut String, src: &str) {
             .map(|c| c.is_ascii_alphanumeric())
             .unwrap_or(false);
     let ends_with_label = dst.ends_with(|c: char| c.is_whitespace())
-        || ["单元", "章", "课", "节", "讲", "篇", "部分", "专题", "模块", "附录", "索引", "后记"]
+        || [
+            "单元", "章", "课", "节", "讲", "篇", "部分", "专题", "模块", "附录", "索引", "后记",
+            "卷", "编", "部", "册", "集", "辑", "回", "话", "幕", "场", "折", "出", "则", "則",
+            "款", "项", "目", "序", "前言", "引言", "绪论", "结语", "跋", "参考文献",
+        ]
             .iter()
             .any(|u| dst.ends_with(u));
     if need_space || ends_with_label {
@@ -1818,7 +1836,16 @@ fn level_from_title(title: &str) -> Option<usize> {
     if let Some((_, lvl)) = match_cjk_heading(title) {
         return Some(lvl);
     }
+    if let Some((_, lvl)) = match_cjk_seq(title) {
+        return Some(lvl);
+    }
+    if let Some((_, lvl)) = match_classical_volume(title) {
+        return Some(lvl);
+    }
     if let Some((_, lvl)) = match_chapter(title) {
+        return Some(lvl);
+    }
+    if let Some((_, lvl)) = match_en_label(title) {
         return Some(lvl);
     }
     if let Some((_, lvl)) = match_part(title) {
@@ -1828,6 +1855,9 @@ fn level_from_title(title: &str) -> Option<usize> {
         return Some(lvl);
     }
     if let Some((_, lvl)) = match_numbered_section(title) {
+        return Some(lvl);
+    }
+    if let Some((_, lvl)) = match_letter_numbered(title) {
         return Some(lvl);
     }
     if let Some((_, lvl)) = match_allcaps_heading(title) {
@@ -1853,25 +1883,47 @@ fn level_from_keywords(title: &str) -> Option<usize> {
     let upper = title.to_uppercase();
     const CHAPTER_ISH: &[&str] = &[
         "INTRODUCTION", "CONCLUSION", "REFERENCES", "BIBLIOGRAPHY", "APPENDIX", "PREFACE",
-        "ACKNOWLEDGMENTS", "ACKNOWLEDGEMENTS", "INDEX", "GLOSSARY", "ABSTRACT", "SUMMARY",
-        "FOREWORD", "目录", "附录", "参考文献", "后记",
+        "ACKNOWLEDGMENTS", "ACKNOWLEDGEMENTS", "ACKNOWLEDGEMENT", "INDEX", "GLOSSARY",
+        "ABSTRACT", "SUMMARY", "FOREWORD", "CONTENTS", "EXECUTIVE SUMMARY",
+        "LIST OF FIGURES", "LIST OF TABLES", "LIST OF ILLUSTRATIONS", "ACRONYMS",
+        "ABBREVIATIONS", "NOTATION", "PROLOGUE", "EPILOGUE", "AFTERWORD", "POSTSCRIPT",
+        "DEDICATION", "COLOPHON", "目录", "目次", "附录", "附錄", "参考文献", "参考书目",
+        "后记", "後記", "前言", "序言", "引言", "绪论", "绪言", "导言", "导论", "结语",
+        "凡例", "例言", "致谢", "致謝",
     ];
     if CHAPTER_ISH.iter().any(|w| upper.contains(w)) {
         return Some(1);
     }
-    const SECTION_ISH: &[&str] = &["小结", "复习题", "练习", "数学活动", "活动课"];
+    // Single-character keywords need exact/prefix matching so "顺序" does not
+    // match "序" and "驰跋" does not match "跋".
+    if title == "序" || title.starts_with("序 ") || title == "跋" || title.starts_with("跋 ") {
+        return Some(1);
+    }
+    const SECTION_ISH: &[&str] = &["小结", "复习题", "练习", "数学活动", "活动课", "习题", "思考题"];
     if SECTION_ISH.iter().any(|w| title.contains(w)) {
         return Some(2);
     }
     None
 }
 
-/// Strong heading patterns only. No broad heuristics.
+/// Strong heading patterns only. No broad heuristics. Each matcher is a
+/// distinct "pattern class" (see docs/toc-patterns.md), so users can force a
+/// single algorithm via `--toc-mode` and body text cannot satisfy the whole
+/// grab-bag at once.
 fn try_chapter_heading(line: &str) -> Option<(String, usize)> {
     if let Some(r) = match_cjk_heading(line) {
         return Some(r);
     }
+    if let Some(r) = match_cjk_seq(line) {
+        return Some(r);
+    }
+    if let Some(r) = match_classical_volume(line) {
+        return Some(r);
+    }
     if let Some(r) = match_chapter(line) {
+        return Some(r);
+    }
+    if let Some(r) = match_en_label(line) {
         return Some(r);
     }
     if let Some(r) = match_numbered_chapter(line) {
@@ -1881,6 +1933,9 @@ fn try_chapter_heading(line: &str) -> Option<(String, usize)> {
         return Some(r);
     }
     if let Some(r) = match_part(line) {
+        return Some(r);
+    }
+    if let Some(r) = match_letter_numbered(line) {
         return Some(r);
     }
     if let Some(r) = match_allcaps_heading(line) {
@@ -1909,33 +1964,68 @@ fn match_chapter(line: &str) -> Option<(String, usize)> {
     if rest.parse::<usize>().is_ok() {
         return Some((format!("Chapter {}", rest), 1));
     }
+    // Roman ("Chapter IV") and word ("Chapter One") numerals. Keep the
+    // original rest so separators survive: "Chapter IV: Title".
+    let first = rest.split_whitespace().next().unwrap_or("");
+    let first = first.trim_end_matches([':', '-', '.']);
+    if is_roman_numeral(first) || word_numeral_to_number(first).is_some() {
+        if rest[first.len()..].trim().is_empty() {
+            return Some((format!("Chapter {}", rest.trim()), 1));
+        }
+        return Some((format!("Chapter {}", rest.trim()), 1));
+    }
     None
 }
 
-/// Chinese numbered headings: 第X单元/部分/篇 → 0, 第X章/专题/讲/模块 → 1,
-/// 第X课/节 → 2. Handles Arabic and Chinese numerals.
+/// Chinese numbered headings: 第X单元/部分/篇/卷/编/部/册/集/辑 → 0,
+/// 第X章/回/话/讲/专题/模块/幕/折/出 → 1, 第X节/课/场/则/條/条 → 2,
+/// 第X款/项/目 → 3. Handles Arabic, full-width, lowercase Chinese numerals
+/// (一…十百零〇两) and financial uppercase numerals (壹贰叁肆伍陆柒捌玖拾).
+/// Also matches spaced numerals ("第 一 章" — callers normalize first, but a
+/// directly-split line with internal spaces is handled by normalize_title_spacing).
 fn match_cjk_heading(line: &str) -> Option<(String, usize)> {
     let s = line.strip_prefix('第')?;
     let num_chars: String = s
         .chars()
-        .take_while(|c| c.is_ascii_digit() || matches!(c, '０'..='９') || "一二三四五六七八九十百零〇两".contains(*c))
+        .take_while(|c| {
+            c.is_ascii_digit()
+                || matches!(c, '０'..='９')
+                || "一二三四五六七八九十百零〇两壹贰叁肆伍陆柒捌玖拾".contains(*c)
+        })
         .collect();
     if num_chars.is_empty() {
         return None;
     }
     let rest = &s[num_chars.len()..];
+    // Multi-char units before their single-char prefixes ("部分" before "部").
     for (unit, level) in [
-        ("单元", 0usize),
-        ("部分", 0),
-        ("篇", 0),
-        ("章", 1),
+        ("部分", 0usize),
+        ("单元", 0),
         ("专题", 1),
-        ("讲", 1),
         ("模块", 1),
-        ("课", 2),
-        ("节", 2),
         ("條", 2),
         ("条", 2),
+        ("卷", 0),
+        ("编", 0),
+        ("部", 0),
+        ("册", 0),
+        ("集", 0),
+        ("辑", 0),
+        ("篇", 0),
+        ("章", 1),
+        ("回", 1),
+        ("话", 1),
+        ("幕", 1),
+        ("折", 1),
+        ("出", 1),
+        ("节", 2),
+        ("课", 2),
+        ("场", 2),
+        ("则", 2),
+        ("則", 2),
+        ("款", 3),
+        ("项", 3),
+        ("目", 3),
     ] {
         if let Some(after) = rest.strip_prefix(unit) {
             let after = after.trim();
@@ -1948,6 +2038,373 @@ fn match_cjk_heading(line: &str) -> Option<(String, usize)> {
         }
     }
     None
+}
+
+/// 公文/文档层次序数 (GB/T 9704-2012): "一、标题" → 1, "（一）标题" → 2,
+/// "（1）标题" / "①标题" / "(a) 标题" → 3. Half-width parentheses accepted.
+/// The third level "1." is deliberately left to `match_numbered_chapter` /
+/// `match_numbered_section` (CY/T 35 chapter numbering) to avoid ambiguity.
+/// Body-scan false positives from enumerations are bounded by requiring the
+/// title to not end with sentence punctuation ("。；，、.").
+fn match_cjk_seq(line: &str) -> Option<(String, usize)> {
+    let t = line.trim();
+    let first = t.chars().next()?;
+    // Fast reject: only Chinese numerals / stems, parens, and circled digits
+    // can start a 公文序号 heading. Avoids a Vec<char> allocation per line.
+    if !is_chinese_ordinal_char(first) && !matches!(first, '（' | '(' | '①' | '②' | '③') {
+        return None;
+    }
+    let chars: Vec<char> = t.chars().collect();
+    // "一、标题" / "甲、标题" (Chinese numeral / heavenly stem + 顿号) → 1
+    if chars.len() >= 2 && chars[1] == '、' && is_chinese_ordinal_char(chars[0]) {
+        let title: String = chars[2..].iter().collect();
+        let title = title.trim();
+        if cjk_seq_title_ok(title) {
+            return Some((format!("{}、 {}", chars[0], title), 1));
+        }
+    }
+    // "（一）标题" → 2, "（1）标题" / "(a) 标题" → 3
+    if chars[0] == '（' || chars[0] == '(' {
+        if let Some(close) = chars.iter().position(|&c| c == '）' || c == ')') {
+            if close >= 2 && close < chars.len() - 1 {
+                let inner: String = chars[1..close].iter().collect();
+                let title: String = chars[close + 1..].iter().collect();
+                let title = title.trim();
+                let prefix: String = chars[..=close].iter().collect();
+                // "（一）" (Chinese numerals) → level 2; "（1）" / "(1)" /
+                // "(a)" (digits / single letter) → level 3.
+                if !inner.is_empty() && inner.chars().all(is_chinese_ordinal_char) {
+                    if cjk_seq_title_ok(title) {
+                        return Some((format!("{} {}", prefix, title), 2));
+                    }
+                } else if inner.chars().all(|c| c.is_ascii_digit() || matches!(c, '０'..='９'))
+                    || (inner.chars().count() == 1 && inner.chars().next().unwrap().is_ascii_alphabetic())
+                {
+                    if cjk_seq_title_ok(title) {
+                        return Some((format!("{} {}", prefix, title), 3));
+                    }
+                }
+            }
+        }
+    }
+    // "①标题" → 3
+    if matches!(chars[0], '①' | '②' | '③') {
+        let title: String = chars[1..].iter().collect();
+        let title = title.trim();
+        if cjk_seq_title_ok(title) {
+            return Some((format!("{} {}", chars[0], title), 3));
+        }
+    }
+    None
+}
+
+fn is_cjk_ordinal_char(c: char) -> bool {
+    c.is_ascii_digit()
+        || matches!(c, '０'..='９')
+        || "一二三四五六七八九十百零〇两壹贰叁肆伍陆柒捌玖拾甲乙丙丁戊己庚辛壬癸".contains(c)
+}
+
+/// Chinese *word* numerals and heavenly stems only (no ASCII/full-width
+/// digits) — used to tell "（一）" (level 2) apart from "（1）" (level 3).
+fn is_chinese_ordinal_char(c: char) -> bool {
+    "一二三四五六七八九十百零〇两壹贰叁肆伍陆柒捌玖拾甲乙丙丁戊己庚辛壬癸".contains(c)
+}
+
+fn cjk_seq_title_ok(title: &str) -> bool {
+    if title.is_empty()
+        || title.chars().count() < 2
+        || title.chars().count() > 60
+        || !title.chars().any(|c| is_cjk_char(c) || c.is_ascii_alphabetic())
+    {
+        return false;
+    }
+    // Real 公文 headings are short phrases — they never contain sentence-final
+    // punctuation (。；！？). Legal/body paragraphs that wrap across lines end
+    // mid-sentence and usually contain a 。 earlier ("一、行政院…之責。立法委…"),
+    // so reject any interior sentence-final punctuation too.
+    if title.contains(['。', '；', '！', '？']) {
+        return false;
+    }
+    !title.ends_with(['，', '、', '.', ';', ',', '：', ':'])
+}
+
+/// 古籍/分册卷式 (classical): "卷一 标题", "卷之一", "卷上/中/下",
+/// "上卷/中卷/下卷", "上册/中册/下册", "上篇/中篇/下篇" → level 0.
+/// No "第" prefix. Common in 四库全书-style classical editions and
+/// multi-volume sets.
+fn match_classical_volume(line: &str) -> Option<(String, usize)> {
+    let t = line.trim();
+    let first = t.chars().next()?;
+    if !matches!(first, '卷' | '上' | '中' | '下') {
+        return None;
+    }
+    let chars: Vec<char> = t.chars().collect();
+    // 卷 + (之一 | 汉字/阿拉伯数字 | 上中下) + 标题或结尾
+    if chars.len() >= 2 && chars[0] == '卷' {
+        let rest: String = chars[1..].iter().collect();
+        let rest = rest.trim_start();
+        let rest_chars: Vec<char> = rest.chars().collect();
+        let consumed = if rest_chars.first() == Some(&'之') {
+            let num: String = rest_chars[1..]
+                .iter()
+                .take_while(|&&c| c.is_ascii_digit() || is_cjk_ordinal_char(c))
+                .collect();
+            if num.is_empty() {
+                return None;
+            }
+            1 + num.chars().count()
+        } else if rest_chars
+            .first()
+            .map_or(false, |&c| c.is_ascii_digit() || is_cjk_ordinal_char(c) || matches!(c, '上' | '中' | '下'))
+        {
+            let num: String = rest_chars
+                .iter()
+                .take_while(|&&c| c.is_ascii_digit() || is_cjk_ordinal_char(c) || matches!(c, '上' | '中' | '下'))
+                .collect();
+            if num.is_empty() {
+                return None;
+            }
+            num.chars().count()
+        } else {
+            return None;
+        };
+        let after: String = rest_chars[consumed..].iter().collect();
+        let after = after.trim();
+        if after.is_empty() {
+            return Some((t.to_string(), 0));
+        }
+        if !after.starts_with(|c: char| is_cjk_char(c) || c.is_ascii_alphanumeric()) {
+            return None;
+        }
+        let num_part: String = rest_chars[..consumed].iter().collect();
+        let title = format!("卷{} {}", num_part, after);
+        if title.chars().count() <= 60 {
+            return Some((title, 0));
+        }
+        return None;
+    }
+    // 上卷/中卷/下卷, 上册/中册/下册, 上篇/中篇/下篇. Bare 卷 matches
+    // ("卷上" is a real classical heading); bare 册/篇 does not ("上册" on a
+    // title page is noise) unless followed by a title.
+    for pre in ['上', '中', '下'] {
+        for post in ['卷', '册', '篇'] {
+            let label = format!("{}{}", pre, post);
+            if let Some(after) = t.strip_prefix(&label) {
+                let after = after.trim();
+                if after.is_empty() {
+                    if post == '卷' {
+                        return Some((t.to_string(), 0));
+                    }
+                    continue;
+                }
+                if after.starts_with(|c: char| is_cjk_char(c) || c.is_ascii_alphanumeric())
+                    && after.chars().count() <= 60
+                {
+                    return Some((format!("{} {}", label, after), 0));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// English "Label + Number" headings (non-Chapter/Part labels):
+/// Unit/Lesson/Section/Module/Topic/Lecture/Act/Scene/Volume/Book/Appendix/
+/// Annex/Article/Clause/Canto/Exhibit/Schedule + Arabic / Roman / word /
+/// letter ("Appendix A") / decimal ("Section 1.2") numbers.
+fn match_en_label(line: &str) -> Option<(String, usize)> {
+    const LABELS: &[(&str, usize)] = &[
+        ("volume ", 0usize),
+        ("book ", 0),
+        ("unit ", 0),
+        ("lesson ", 1),
+        ("lecture ", 1),
+        ("act ", 1),
+        ("module ", 1),
+        ("topic ", 1),
+        ("canto ", 1),
+        ("appendix ", 1),
+        ("annex ", 1),
+        ("article ", 1),
+        ("schedule ", 1),
+        ("exhibit ", 1),
+        ("section ", 2),
+        ("scene ", 2),
+        ("clause ", 2),
+    ];
+    if !line.as_bytes().first().map_or(false, |b| b.is_ascii_alphabetic()) {
+        return None;
+    }
+    let lower = line.to_lowercase();
+    for &(kw, level) in LABELS {
+        if !lower.starts_with(kw) {
+            continue;
+        }
+        let rest = line[kw.len()..].trim();
+        if rest.is_empty() {
+            return None;
+        }
+        let first_tok_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let mut first_tok = &rest[..first_tok_end];
+        first_tok = first_tok.trim_end_matches([':', '-', '.', '—', '|']);
+        let num = if !first_tok.is_empty() && first_tok.chars().all(|c| c.is_ascii_digit()) {
+            Some(first_tok.to_string())
+        } else if is_decimal_number(first_tok) {
+            Some(first_tok.to_string())
+        } else if is_roman_numeral(first_tok) {
+            Some(first_tok.to_string())
+        } else if word_numeral_to_number(first_tok).is_some() {
+            Some(first_tok.to_string())
+        } else if first_tok.chars().count() == 1
+            && first_tok.chars().next().unwrap().is_ascii_uppercase()
+            && matches!(kw, "appendix " | "annex " | "exhibit " | "schedule " | "volume " | "book ")
+        {
+            Some(first_tok.to_string())
+        } else {
+            None
+        }?;
+        let title = rest[first_tok_end..]
+            .trim_start_matches([':', '-', '.', '—', '|', ' '])
+            .trim();
+        if title.is_empty() || title.chars().count() > 80 {
+            return None;
+        }
+        if !title.chars().any(|c| c.is_ascii_alphabetic() || is_cjk_char(c)) {
+            return None;
+        }
+        if title.ends_with(['.', '。', '！', '？', '；']) {
+            return None;
+        }
+        let label = line[..kw.len()].trim();
+        return Some((format!("{} {} {}", label, num, title), level));
+    }
+    None
+}
+
+/// "1.2" / "1.2.3" style decimal tokens (no trailing dot).
+fn is_decimal_number(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    if bytes.len() < 3 || !bytes[0].is_ascii_digit() {
+        return false;
+    }
+    if !s.contains('.') || s.ends_with('.') {
+        return false;
+    }
+    s.chars().all(|c| c.is_ascii_digit() || c == '.')
+}
+
+/// True when `s` is a well-formed Roman numeral (1..3999).
+fn is_roman_numeral(s: &str) -> bool {
+    if s.is_empty() || s.chars().count() > 15 {
+        return false;
+    }
+    let upper = s.to_uppercase();
+    if !upper.chars().all(|c| "IVXLCDM".contains(c)) {
+        return false;
+    }
+    let mut prev = 0usize;
+    let mut total = 0usize;
+    for c in upper.chars().rev() {
+        let v = match c {
+            'I' => 1,
+            'V' => 5,
+            'X' => 10,
+            'L' => 50,
+            'C' => 100,
+            'D' => 500,
+            'M' => 1000,
+            _ => return false,
+        };
+        if v < prev {
+            total = total.saturating_sub(v);
+        } else {
+            total += v;
+            prev = v;
+        }
+    }
+    total > 0 && total < 4000
+}
+
+/// English cardinal words used in headings ("Chapter One", "Part Two").
+fn word_numeral_to_number(w: &str) -> Option<usize> {
+    const WORDS: &[(&str, usize)] = &[
+        ("one", 1), ("two", 2), ("three", 3), ("four", 4), ("five", 5),
+        ("six", 6), ("seven", 7), ("eight", 8), ("nine", 9), ("ten", 10),
+        ("eleven", 11), ("twelve", 12), ("thirteen", 13), ("fourteen", 14),
+        ("fifteen", 15), ("sixteen", 16), ("seventeen", 17), ("eighteen", 18),
+        ("nineteen", 19), ("twenty", 20), ("thirty", 30), ("forty", 40), ("fifty", 50),
+    ];
+    let w = w.trim_end_matches(['.', ',', ':', '-']).to_lowercase();
+    WORDS.iter().find(|(k, _)| *k == w).map(|(_, n)| *n)
+}
+
+/// Outline / Annex numbering: "I. Title" (roman + period) and "A. Title"
+/// (single uppercase letter + period) → level 1; "A.1 Title" (letter-decimal,
+/// ISO/GB annex clause) → level 2.
+fn match_letter_numbered(line: &str) -> Option<(String, usize)> {
+    let t = line.trim();
+    let first = t.chars().next()?;
+    if !first.is_ascii_uppercase() && !"IVXLCDM".contains(first) {
+        return None;
+    }
+    let chars: Vec<char> = t.chars().collect();
+    if chars.len() < 4 {
+        return None;
+    }
+    // "A.1 Title" / "A.1.1 Title"
+    if chars[0].is_ascii_uppercase() && chars[1] == '.' && chars[2].is_ascii_digit() {
+        let mut i = 2;
+        while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '.') {
+            i += 1;
+        }
+        if i < chars.len() && chars[i].is_whitespace() {
+            let num: String = chars[..i].iter().collect();
+            let title: String = chars[i..].iter().collect();
+            let title = title.trim();
+            if heading_title_ok(title) {
+                return Some((format!("{} {}", num, title), 2));
+            }
+        }
+        return None;
+    }
+    // "II. Title" (roman run + period) / "A. Title" (single uppercase letter)
+    let mut i = 0;
+    while i < chars.len() && "IVXLCDM".contains(chars[i]) {
+        i += 1;
+    }
+    if i == 0 && chars[0].is_ascii_uppercase() {
+        i = 1;
+    }
+    if i >= 1 && i < chars.len() && chars[i] == '.' && i + 1 < chars.len() && chars[i + 1].is_whitespace() {
+        let num: String = chars[..i].iter().collect();
+        let is_roman = is_roman_numeral(&num);
+        let single_letter = !is_roman
+            && num.chars().count() == 1
+            && num.chars().next().unwrap().is_ascii_uppercase();
+        let valid = is_roman || single_letter;
+        if !valid {
+            return None;
+        }
+        let title: String = chars[i + 2..].iter().collect();
+        let title = title.trim();
+        // A single letter ("A. Scope") needs a ≥2-word title so "A. Smith"
+        // (a reference author) does not look like a heading; roman "I. Title"
+        // is distinctive enough on its own.
+        if heading_title_ok(title) && (!single_letter || title.split_whitespace().count() >= 2) {
+            return Some((format!("{} {}", num, title), 1));
+        }
+    }
+    None
+}
+
+fn heading_title_ok(title: &str) -> bool {
+    if title.is_empty() || title.chars().count() < 2 || title.chars().count() > 80 {
+        return false;
+    }
+    if !title.chars().any(|c| c.is_ascii_alphabetic() || is_cjk_char(c)) {
+        return false;
+    }
+    !title.ends_with(['.', '。', '！', '？', '；', ';', ',', '，'])
 }
 
 /// "N. Title" (single number + period) → chapter (level 1).
@@ -1970,11 +2427,19 @@ fn match_numbered_chapter(line: &str) -> Option<(String, usize)> {
     let title: String = chars[i + 1..].iter().collect();
     let title = title.trim().to_string();
     let word_count = title.split_whitespace().count();
-    if title.len() < 3 || title.len() > 80 || word_count > 8 || word_count < 2 {
+    let first_char = title.chars().next().unwrap_or(' ');
+    let cjk_title = is_cjk_char(first_char);
+    // CJK titles ("1. 引言", CY/T 35) are often a single token; English titles
+    // keep the ≥2-word rule to avoid list-item noise.
+    if title.len() < 3 || title.len() > 80 || word_count > 8 || (!cjk_title && word_count < 2) {
         return None;
     }
-    let first_char = title.chars().next().unwrap_or(' ');
-    if !first_char.is_ascii_uppercase() {
+    if !first_char.is_ascii_uppercase() && !cjk_title {
+        return None;
+    }
+    // A heading does not end with sentence punctuation; calligraphy/practice
+    // books number stroke steps as "1. 先写撇。" — reject those.
+    if title.ends_with(['。', '；', '，', '！', '？', '、']) {
         return None;
     }
     if title.contains("/*") || title.contains("*/") || title.contains('{') || title.contains('}') {
@@ -2023,13 +2488,16 @@ fn match_space_numbered_chapter(line: &str) -> Option<(String, usize)> {
         return None;
     }
     let first_char = title.chars().next().unwrap_or(' ');
-    if !first_char.is_ascii_uppercase() {
+    if !first_char.is_ascii_uppercase() && !is_cjk_char(first_char) {
         return None;
     }
     if title.contains("/*") || title.contains("*/") || title.contains('{') || title.contains('}') {
         return None;
     }
     if !title.chars().any(|c| c.is_alphabetic() || is_cjk_char(c)) {
+        return None;
+    }
+    if title.ends_with(['。', '；', '，', '！', '？', '、']) {
         return None;
     }
     Some((format!("{} {}", num, title), 1))
@@ -2064,7 +2532,11 @@ fn match_numbered_section(line: &str) -> Option<(String, usize)> {
     let title: String = chars[i..].iter().collect();
     let title = title.trim().to_string();
     let word_count = title.split_whitespace().count();
-    if word_count > 12 || title.ends_with('.') || title.len() < 2 {
+    if word_count > 12
+        || title.ends_with('.')
+        || title.ends_with(['。', '；', '，', '！', '？', '、'])
+        || title.len() < 2
+    {
         return None;
     }
     if title.contains("/*") || title.contains("*/") || title.contains('{') || title.contains('}') {
@@ -2101,7 +2573,17 @@ fn match_part(line: &str) -> Option<(String, usize)> {
     let rest = line[5..].trim();
     let first_char = rest.chars().next()?;
     if !first_char.is_ascii_digit() && !"IVXLCDMivxlcdm".contains(first_char) {
-        return None;
+        // Word numerals: "Part Two".
+        let first = rest.split_whitespace().next().unwrap_or("");
+        if word_numeral_to_number(first).is_none() {
+            return None;
+        }
+        let title = rest[first.len()..].trim_start_matches([':', '-', '.', ' ']).trim();
+        return Some((if title.is_empty() {
+            format!("Part {}", rest.trim())
+        } else {
+            format!("Part {} {}", first, title)
+        }, 0));
     }
     for sep in [':', '-', '.'] {
         if let Some((num_str, title_suffix)) = rest.split_once(sep) {
@@ -2128,7 +2610,10 @@ fn match_allcaps_heading(line: &str) -> Option<(String, usize)> {
     let upper = line.to_uppercase();
     const HEADING_WORDS: &[&str] = &[
         "INTRODUCTION", "CONCLUSION", "REFERENCES", "BIBLIOGRAPHY", "APPENDIX", "PREFACE",
-        "ACKNOWLEDGMENTS", "INDEX", "GLOSSARY", "ABSTRACT", "SUMMARY", "FOREWORD", "CONTENTS",
+        "ACKNOWLEDGMENTS", "ACKNOWLEDGEMENTS", "INDEX", "GLOSSARY", "ABSTRACT", "SUMMARY",
+        "FOREWORD", "CONTENTS", "EXECUTIVE SUMMARY", "LIST OF FIGURES", "LIST OF TABLES",
+        "LIST OF ILLUSTRATIONS", "ACRONYMS", "ABBREVIATIONS", "NOTATION", "PROLOGUE",
+        "EPILOGUE", "AFTERWORD", "POSTSCRIPT", "DEDICATION", "COLOPHON",
     ];
     if HEADING_WORDS.iter().any(|&w| upper.contains(w)) {
         return Some((line.to_string(), 1));
@@ -2146,11 +2631,35 @@ fn strip_numbering_prefix(title: &str) -> String {
             return rest.to_string();
         }
     }
+    // 公文序号: "一、标题" "（一）标题" "（1）标题" "①标题" → 标题
+    if let Some(rest) = cjk_seq_rest(t) {
+        return rest.to_string();
+    }
+    // 古籍卷式: "卷一 标题" "卷之一 标题" → 标题
+    if let Some(rest) = classical_volume_rest(t) {
+        return rest.to_string();
+    }
     let lower = t.to_lowercase();
-    for kw in ["chapter ", "part ", "appendix ", "unit ", "lesson ", "section ", "module "] {
+    for kw in [
+        "chapter ", "part ", "appendix ", "unit ", "lesson ", "section ", "module ",
+        "volume ", "book ", "lecture ", "act ", "scene ", "topic ", "canto ", "annex ",
+        "article ", "clause ", "exhibit ", "schedule ",
+    ] {
         if let Some(rest) = lower.strip_prefix(kw) {
             let prefix_len = lower.len() - rest.len();
             let rest = &t[prefix_len..];
+            // Strip digits, roman numerals, word numerals, or a single letter
+            // ("Appendix A"), then any separator.
+            let rest = rest.trim_start();
+            let mut rest = rest.trim_start_matches(|c: char| c.is_ascii_digit() || "ivxlcdmIVXLCDM ".contains(c));
+            if let Some(first) = rest.chars().next() {
+                if first.is_ascii_uppercase() && rest.len() > first.len_utf8() {
+                    let after_first = &rest[first.len_utf8()..];
+                    if after_first.starts_with([':', '-', '.', ' ']) || after_first.is_empty() {
+                        rest = after_first;
+                    }
+                }
+            }
             let rest = rest
                 .trim_start_matches(|c: char| c.is_ascii_digit() || "ivxlcdmIVXLCDM ".contains(c))
                 .trim_start_matches([':', '-', '.', ' ', '\t']);
@@ -2181,14 +2690,18 @@ fn cjk_heading_rest(t: &str) -> Option<&str> {
     let s = t.strip_prefix('第')?;
     let num_len = s
         .chars()
-        .take_while(|c| c.is_ascii_digit() || matches!(c, '０'..='９') || "一二三四五六七八九十百零〇两".contains(*c))
+        .take_while(|c| {
+            c.is_ascii_digit()
+                || matches!(c, '０'..='９')
+                || "一二三四五六七八九十百零〇两壹贰叁肆伍陆柒捌玖拾".contains(*c)
+        })
         .map(|c| c.len_utf8())
         .sum::<usize>();
     if num_len == 0 {
         return None;
     }
     let rest = &s[num_len..];
-    for unit in ["单元", "部分", "篇", "章", "专题", "讲", "模块", "课", "节", "條", "条"] {
+    for unit in ["部分", "单元", "专题", "模块", "條", "条", "卷", "编", "部", "册", "集", "辑", "篇", "章", "回", "话", "幕", "折", "出", "节", "课", "场", "则", "則", "款", "项", "目", "讲"] {
         if let Some(after) = rest.strip_prefix(unit) {
             let after = after.trim();
             if after.is_empty() {
@@ -2200,8 +2713,90 @@ fn cjk_heading_rest(t: &str) -> Option<&str> {
     None
 }
 
-/// Strip leading tokens that carry no CJK/ASCII-alphanumeric content (garbled
-/// glyphs from broken ToUnicode CMaps, bullet markers, …).
+/// Strip a leading 公文序号 prefix ("一、", "（一）", "（1）", "①") and return
+/// the remaining title, if any.
+fn cjk_seq_rest(t: &str) -> Option<String> {
+    let chars: Vec<char> = t.trim().chars().collect();
+    if chars.is_empty() {
+        return None;
+    }
+    // "一、标题"
+    if chars.len() >= 2 && chars[1] == '、' && is_cjk_ordinal_char(chars[0]) {
+        let rest: String = chars[2..].iter().collect();
+        let rest = rest.trim().to_string();
+        return if rest.is_empty() { None } else { Some(rest) };
+    }
+    // "（一）标题" / "（1）标题" / "(1) 标题" / "(a) 标题"
+    if chars[0] == '（' || chars[0] == '(' {
+        if let Some(close) = chars.iter().position(|&c| c == '）' || c == ')') {
+            let inner: String = chars[1..close].iter().collect();
+            let valid = (!inner.is_empty() && inner.chars().all(is_cjk_ordinal_char))
+                || (!inner.is_empty() && inner.chars().all(|c| c.is_ascii_digit()))
+                || (inner.chars().count() == 1 && inner.chars().next().unwrap().is_ascii_alphabetic());
+            if valid && close + 1 < chars.len() {
+                let rest: String = chars[close + 1..].iter().collect();
+                let rest = rest.trim().to_string();
+                return if rest.is_empty() { None } else { Some(rest) };
+            }
+        }
+        return None;
+    }
+    // "①标题"
+    if matches!(chars[0], '①' | '②' | '③') {
+        let rest: String = chars[1..].iter().collect();
+        let rest = rest.trim().to_string();
+        return if rest.is_empty() { None } else { Some(rest) };
+    }
+    None
+}
+
+/// Strip a leading 古籍卷式 prefix ("卷一 ", "卷之一 ", "上卷 ") and return
+/// the remaining title, if any.
+fn classical_volume_rest(t: &str) -> Option<String> {
+    let s = t.trim();
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() >= 2 && chars[0] == '卷' {
+        let rest: String = chars[1..].iter().collect();
+        let rest = rest.trim_start();
+        let rest_chars: Vec<char> = rest.chars().collect();
+        let consumed = if rest_chars.first() == Some(&'之') {
+            let num: String = rest_chars[1..]
+                .iter()
+                .take_while(|&&c| c.is_ascii_digit() || is_cjk_ordinal_char(c))
+                .collect();
+            if num.is_empty() {
+                return None;
+            }
+            1 + num.chars().count()
+        } else {
+            let num: String = rest_chars
+                .iter()
+                .take_while(|&&c| c.is_ascii_digit() || is_cjk_ordinal_char(c) || matches!(c, '上' | '中' | '下'))
+                .collect();
+            if num.is_empty() {
+                return None;
+            }
+            num.chars().count()
+        };
+        if consumed >= rest_chars.len() {
+            return None;
+        }
+        let after: String = rest_chars[consumed..].iter().collect();
+        let after = after.trim().to_string();
+        return if after.is_empty() { None } else { Some(after) };
+    }
+    for pre in ['上', '中', '下'] {
+        for post in ['卷', '册', '篇'] {
+            let label = format!("{}{}", pre, post);
+            if let Some(after) = s.strip_prefix(&label) {
+                let after = after.trim().to_string();
+                return if after.is_empty() { None } else { Some(after) };
+            }
+        }
+    }
+    None
+}
+
 fn strip_garbage_prefix(t: &str) -> String {
     let mut words: Vec<&str> = t.split_whitespace().collect();
     while words.len() > 1 {
@@ -2246,7 +2841,9 @@ fn normalize_title_spacing(title: &str) -> String {
         "观察与猜想", "实验与探究", "信息技术应用", "探究与发现", "综合与实践",
         "复习题", "练习", "小结", "写作", "综合性学习", "思考", "整理和复习",
         "课外古诗词诵读", "名著导读", "单元", "章", "节", "课", "讲", "篇", "部分",
-        "专题", "模块", "框", "活动",
+        "专题", "模块", "框", "活动", "卷", "编", "部", "册", "集", "辑", "回", "话",
+        "幕", "场", "折", "出", "则", "則", "款", "项", "目", "序", "前言", "引言",
+        "绪论", "结语", "跋",
     ];
     let chars: Vec<char> = out.chars().collect();
     let mut collapsed = String::with_capacity(out.len());
@@ -2283,6 +2880,8 @@ fn is_unit_word(s: &str) -> bool {
     matches!(
         s,
         "课" | "章" | "单元" | "节" | "讲" | "篇" | "部分" | "专题" | "模块" | "框" | "條" | "条"
+            | "卷" | "编" | "部" | "册" | "集" | "辑" | "回" | "话" | "幕" | "场" | "折" | "出"
+            | "则" | "則" | "款" | "项" | "目"
     )
 }
 
@@ -2327,6 +2926,18 @@ fn is_cjk_char(c: char) -> bool {
 
 fn is_numeric_token(s: &str) -> bool {
     !s.is_empty() && s.chars().all(|c| c.is_ascii_digit() || matches!(c, '０'..='９'))
+}
+
+/// Parse a TOC page reference: "42", "p.42", "pp. 42", "第42页", "42頁", "42页".
+fn parse_page_ref(s: &str) -> Option<usize> {
+    let lower = s.trim().to_lowercase();
+    let t = lower
+        .strip_prefix("pp.")
+        .or_else(|| lower.strip_prefix("p."))
+        .or_else(|| lower.strip_prefix("第"))
+        .unwrap_or(&lower);
+    let t = t.strip_suffix("页").or_else(|| t.strip_suffix("頁")).unwrap_or(t);
+    parse_page_text(t.trim())
 }
 
 fn parse_page_text(s: &str) -> Option<usize> {
@@ -2652,5 +3263,119 @@ mod tests {
         assert_eq!(normalize_title_spacing("问题研究 如何看待农民工现象"), "问题研究 如何看待农民工现象");
         assert_eq!(normalize_title_spacing("人 口 分 布"), "人口分布");
         assert_eq!(normalize_title_spacing("第1课 中华文明的起源"), "第1课 中华文明的起源");
+    }
+
+    #[test]
+    fn test_cjk_heading_missing_units() {
+        assert_eq!(match_cjk_heading("第一回 宴桃园豪杰三结义").map(|(_, l)| l), Some(1));
+        assert_eq!(match_cjk_heading("第一卷 序章").map(|(_, l)| l), Some(0));
+        assert_eq!(match_cjk_heading("第二编 分则").map(|(_, l)| l), Some(0));
+        assert_eq!(match_cjk_heading("第一部 起源").map(|(_, l)| l), Some(0));
+        assert_eq!(match_cjk_heading("第三册 物理").map(|(_, l)| l), Some(0));
+        assert_eq!(match_cjk_heading("第一集 觉醒").map(|(_, l)| l), Some(0));
+        assert_eq!(match_cjk_heading("第一幕 开幕").map(|(_, l)| l), Some(1));
+        assert_eq!(match_cjk_heading("第一场 重逢").map(|(_, l)| l), Some(2));
+        assert_eq!(match_cjk_heading("第一折 惊艳").map(|(_, l)| l), Some(1));
+        assert_eq!(match_cjk_heading("第一出 游园").map(|(_, l)| l), Some(1));
+        assert_eq!(match_cjk_heading("第一话 新的旅程").map(|(_, l)| l), Some(1));
+        assert_eq!(match_cjk_heading("第一则 世说新语").map(|(_, l)| l), Some(2));
+        assert_eq!(match_cjk_heading("第一款 总则").map(|(_, l)| l), Some(3));
+        assert_eq!(match_cjk_heading("第一项 定义").map(|(_, l)| l), Some(3));
+        assert_eq!(match_cjk_heading("第一目 附则").map(|(_, l)| l), Some(3));
+        assert_eq!(match_cjk_heading("第壹章 总纲").map(|(_, l)| l), Some(1));
+        assert_eq!(match_cjk_heading("第十卷 列传").map(|(_, l)| l), Some(0));
+    }
+
+    #[test]
+    fn test_cjk_seq_gongwen() {
+        assert_eq!(match_cjk_seq("一、指导思想").map(|(_, l)| l), Some(1));
+        assert_eq!(match_cjk_seq("（一）基本原则").map(|(_, l)| l), Some(2));
+        assert_eq!(match_cjk_seq("(一) 基本原则").map(|(_, l)| l), Some(2));
+        assert_eq!(match_cjk_seq("（1）健全机制").map(|(_, l)| l), Some(3));
+        assert_eq!(match_cjk_seq("(1) 健全机制").map(|(_, l)| l), Some(3));
+        assert_eq!(match_cjk_seq("(a) First Issue").map(|(_, l)| l), Some(3));
+        assert_eq!(match_cjk_seq("①加强领导").map(|(_, l)| l), Some(3));
+        assert_eq!(match_cjk_seq("甲、总体要求").map(|(_, l)| l), Some(1));
+        // 句子式列举（以句号结尾）不是标题
+        assert!(match_cjk_seq("一、根据《办法》规定，应当予以处罚。").is_none());
+        assert!(match_cjk_seq("（1）根据图1所示，分析如下。").is_none());
+        // 无标题的孤序号不是标题
+        assert!(match_cjk_seq("一、").is_none());
+        assert!(match_cjk_seq("（一）").is_none());
+    }
+
+    #[test]
+    fn test_classical_volume() {
+        assert_eq!(match_classical_volume("卷一 五经辨惑").map(|(t, l)| (l, t.clone())), Some((0, "卷一 五经辨惑".to_string())));
+        assert_eq!(match_classical_volume("卷之一 原道").map(|(_, l)| l), Some(0));
+        assert_eq!(match_classical_volume("卷上 天文训").map(|(_, l)| l), Some(0));
+        assert_eq!(match_classical_volume("上卷 总论").map(|(_, l)| l), Some(0));
+        assert_eq!(match_classical_volume("中册 几何").map(|(_, l)| l), Some(0));
+        assert_eq!(match_classical_volume("下篇 附录").map(|(_, l)| l), Some(0));
+        // 非卷式的词不应命中
+        assert!(match_classical_volume("卷土重来未可知").is_none());
+        assert!(match_classical_volume("卷发教程").is_none());
+    }
+
+    #[test]
+    fn test_en_label() {
+        assert_eq!(match_en_label("Lesson 3: Numbers and Algebra").map(|(_, l)| l), Some(1));
+        assert_eq!(match_en_label("Unit 2 The Cell").map(|(_, l)| l), Some(0));
+        assert_eq!(match_en_label("Section 1.2 Origins of ECS").map(|(_, l)| l), Some(2));
+        assert_eq!(match_en_label("Appendix A Reference Tables").map(|(_, l)| l), Some(1));
+        assert_eq!(match_en_label("Annex C Test Methods").map(|(_, l)| l), Some(1));
+        assert_eq!(match_en_label("Act IV The Tempest").map(|(_, l)| l), Some(1));
+        assert_eq!(match_en_label("Volume I Foundations").map(|(_, l)| l), Some(0));
+        assert_eq!(match_en_label("Scene 2 The Balcony").map(|(_, l)| l), Some(2));
+        assert_eq!(match_en_label("Canto III The Inferno").map(|(_, l)| l), Some(1));
+        // 缺标题不命中
+        assert!(match_en_label("Book 5").is_none());
+        assert!(match_en_label("Lesson").is_none());
+    }
+
+    #[test]
+    fn test_chapter_roman_and_word() {
+        assert_eq!(match_chapter("Chapter IV: The Rendering Problem").map(|(t, l)| (l, t)), Some((1, "Chapter IV: The Rendering Problem".to_string())));
+        assert_eq!(match_chapter("Chapter One Foundations").map(|(_, l)| l), Some(1));
+        assert_eq!(match_part("Part Two Rendering").map(|(_, l)| l), Some(0));
+        assert_eq!(match_part("Part One").map(|(_, l)| l), Some(0));
+    }
+
+
+    #[test]
+    fn test_letter_numbered() {
+        assert_eq!(match_letter_numbered("I. Introduction").map(|(_, l)| l), Some(1));
+        assert_eq!(match_letter_numbered("II. Background and Related Work").map(|(_, l)| l), Some(1));
+        assert_eq!(match_letter_numbered("A. Background and Motivation").map(|(_, l)| l), Some(1));
+        assert_eq!(match_letter_numbered("A.1 General").map(|(_, l)| l), Some(2));
+        assert_eq!(match_letter_numbered("B.2.1 Definitions").map(|(_, l)| l), Some(2));
+        assert!(match_letter_numbered("a. scope").is_none());
+        assert!(match_letter_numbered("1. Scope").is_none());
+    }
+
+    #[test]
+    fn test_heading_scan_spaced_chinese_numeral() {
+        // 修复：heading 扫描先做 normalize_title_spacing，"第 一 章" 可识别
+        let entries = extract_headings("第 一 章 總綱\n第1條\n中華民國之主權屬於國民全體。", 1);
+        let titles: Vec<&str> = entries.iter().map(|e| e.title.as_str()).collect();
+        assert!(titles.iter().any(|t| *t == "第一章 總綱"), "got {:?}", titles);
+        assert!(titles.iter().any(|t| *t == "第1條"), "got {:?}", titles);
+    }
+
+    #[test]
+    fn test_page_ref() {
+        assert_eq!(parse_page_ref("42"), Some(42));
+        assert_eq!(parse_page_ref("p.42"), Some(42));
+        assert_eq!(parse_page_ref("pp. 42"), Some(42));
+        assert_eq!(parse_page_ref("第42页"), Some(42));
+        assert_eq!(parse_page_ref("42页"), Some(42));
+        assert_eq!(parse_page_ref("42頁"), Some(42));
+        assert_eq!(parse_page_ref("abc"), None);
+    }
+
+    #[test]
+    fn test_plain_line_page_chinese_page_suffix() {
+        // "标题42页" 末尾带"页"也能解析页码
+        assert_eq!(plain_line_page("第1课 凡尔赛条约42页"), Some(("第1课 凡尔赛条约".to_string(), 42)));
     }
 }

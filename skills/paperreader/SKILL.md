@@ -105,6 +105,26 @@ Extraction priority (aligned with ISO 32000-1):
 2. **Printed TOC pages** — detects the 目录/Contents page(s), then parses entries. A fast plain-text pass (dot leaders, right-aligned page numbers, wrapped-title continuations, multi-column grid TOCs) covers most textbooks in ~0.02s; when plain text is garbled (broken ToUnicode CMaps, interleaved page numbers), a layout-aware pass uses word geometry (right-aligned page runs, indentation, font size) on only the marker page ±2 pages.
 3. **Heading scan** — last resort: scan (sampled) pages for strong chapter/section heading patterns.
 
+Each heading pattern is a **separate matcher** (one pattern class = one algorithm), so
+body text cannot satisfy a grab-bag matcher at once. Covered classes (see
+`docs/toc-patterns.md`):
+
+- **cjk-unit** — `第X卷/编/部/册/集/辑/篇/部分/单元`(0)、`第X章/回/话/讲/专题/模块/幕/折/出`(1)、
+  `第X节/课/场/则/條/条`(2)、`第X款/项/目`(3)；阿拉伯/全角/中文小写/大写数字，含空格序数
+  （`第 一 章`）。
+- **cjk-seq** — 公文层次序数 (GB/T 9704)：`一、`(1)、`（一）`(2)、`（1）`/`①`/`(a)`(3)。
+- **classical** — 古籍卷式：`卷一`、`卷之一`、`卷上/中/下`、`上卷/中卷/下卷`、`上册/中册/下册`(0)。
+- **en-label** — `Part/Volume/Book/Unit`(0)、`Chapter/Lesson/Lecture/Act/Module/Topic/Canto/Appendix/Annex/Article/Schedule/Exhibit`(1)、
+  `Section/Scene/Clause`(2)，数字支持阿拉伯/罗马(`Chapter IV`)/单词(`Part Two`)/字母(`Appendix A`)/小数(`Section 1.2`)。
+- **decimal** — `1.`、`1.1`、`1.1.1`（层级=点数，CY/T 35 中文标题亦可）。
+- **letter-decimal** — `I. Title`、`A. Title`、`A.1 Title`（Annex/大纲编号）。
+- **keyword** — 前后置文：目录/目次/序/前言/引言/绪论/结语/跋/凡例/致谢/附录/参考文献/索引/后记、
+  Foreword/Preface/Introduction/Acknowledgements/Abstract/Executive Summary/List of Figures/Tables/
+  Acronyms/Notation/Prologue/Epilogue/Afterword/Postscript/Dedication/Colophon/References/Bibliography/Index/Glossary。
+- **allcaps** — 全大写已知标题（`INTRODUCTION`、`CHAPTER ONE`）。
+
+TOC 页码也支持 `p.42` / `Page 42` / `第42页` / `42页` 写法。
+
 Page numbers are reported as **physical 1-indexed pages** (usable with `--extract-page`/`--extract-range`): each title is located in the body (via the on-disk index cache when available, else a sampled scan), which derives the median front-matter offset between printed and physical page numbers and corrects every entry. Indexed documents scan the whole body in ~0.1s; unindexed documents sample pages, so pages may be approximate (±10 on very large books).
 
 **For exact pages, index first:**
