@@ -1,4 +1,5 @@
 use clap::Parser;
+use crate::toc::TocMode;
 
 /// 命令行参数解析结构体
 /// Tailwind and custom configurations for CLI options
@@ -88,6 +89,15 @@ pub struct Cli {
     /// Force heuristic TOC detection even when PDF outlines are available
     #[arg(long)]
     pub toc_heuristic: bool,
+
+    /// TOC detection algorithm (auto, outlines, heuristic, plain, layout, heading).
+    /// Forced modes run only that algorithm; use --toc-modes to list them.
+    #[arg(long, value_enum)]
+    pub toc_mode: Option<TocMode>,
+
+    /// List available TOC detection algorithms and exit
+    #[arg(long)]
+    pub toc_modes: bool,
 
     /// Check CJK text extraction quality by sampling random pages and reporting character coverage
     #[arg(long)]

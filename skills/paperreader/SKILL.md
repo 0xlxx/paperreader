@@ -77,8 +77,27 @@ paperreader --case-sensitive "Query"       # Case-sensitive
 ```bash
 paperreader --file "paper.pdf" --toc              # Extract TOC (outlines first, then heuristics)
 paperreader --file "paper.pdf" --toc --json       # Structured JSON: source, total_pages, entries
-paperreader --file "paper.pdf" --toc --toc-heuristic  # Force heuristics, skip embedded outlines
+paperreader --toc-modes                          # List available detection algorithms
+paperreader --file "paper.pdf" --toc --toc-mode layout  # Force one algorithm (see below)
+paperreader --file "paper.pdf" --toc --toc-heuristic   # Heuristics only, skip embedded outlines
 ```
+
+When the default `--toc` result is poor, inspect the PDF and force the algorithm that fits:
+
+```
+paperreader --toc-modes
+  auto       Default: embedded outlines -> plain scan -> layout scan -> heading scan
+  outlines   Embedded PDF outlines only (/Outlines)
+  heuristic  Heuristic chain only (plain -> layout -> heading), skipping outlines
+  plain      Plain-text scan only (dot leaders / right-aligned numbers / multi-column)
+  layout     Layout-aware scan only (word geometry)
+  heading    Heading scan only (sampled pages)
+```
+
+Forced modes (`plain`/`layout`/`heading`) run **only** that algorithm and return an empty
+TOC when it finds nothing — e.g. garbled-ToUnicode textbooks need `--toc-mode layout`,
+tech books whose TOC page-number column is not in the text layer need `--toc-mode plain`,
+and papers without any TOC structure need `--toc-mode heading`.
 
 Extraction priority (aligned with ISO 32000-1):
 

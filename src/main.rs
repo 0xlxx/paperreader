@@ -68,6 +68,17 @@ fn main() {
 
     let args = Cli::parse();
 
+    if args.toc_modes {
+        println!("Available TOC modes (--toc-mode <MODE>):");
+        println!("  auto       Default: embedded outlines -> plain scan -> layout scan -> heading scan");
+        println!("  outlines   Embedded PDF outlines only (/Outlines)");
+        println!("  heuristic  Heuristic chain only (plain -> layout -> heading), skipping outlines");
+        println!("  plain      Plain-text scan only (dot leaders / right-aligned numbers / multi-column)");
+        println!("  layout     Layout-aware scan only (word geometry)");
+        println!("  heading    Heading scan only (sampled pages)");
+        return;
+    }
+
     if args.interactive && args.json {
         eprintln!("Error: -I/--interactive and --json are mutually exclusive");
         std::process::exit(1);
@@ -191,7 +202,12 @@ fn main() {
         }
         let target = &pdfs[0];
         let _toc_start = Instant::now();
-        let report = toc::detect_toc(target, args.toc_heuristic);
+        let mode = args.toc_mode.unwrap_or(if args.toc_heuristic {
+            toc::TocMode::Heuristic
+        } else {
+            toc::TocMode::Auto
+        });
+        let report = toc::detect_toc(target, mode);
         eprintln!("TOC scan completed in {:.1}s", _toc_start.elapsed().as_secs_f64());
         if args.json {
             println!("{}", serde_json::to_string_pretty(&serde_json::json!({

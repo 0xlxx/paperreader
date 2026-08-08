@@ -103,11 +103,49 @@ struct RawWord {
     width: f32,
 }
 
-/// Extract the document TOC.
+/// Which algorithm is used to detect a table of contents.
+///
+/// List available modes with `paperreader --toc-modes`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum TocMode {
+    /// Default: embedded outlines, then plain → layout → heading scan.
+    Auto,
+    /// Embedded PDF outlines only (`/Outlines`).
+    Outlines,
+    /// Heuristic chain only (plain → layout → heading), skipping outlines.
+    Heuristic,
+    /// Plain-text scan only (dot leaders / right-aligned numbers / multi-column).
+    Plain,
+    /// Layout-aware scan only (word geometry).
+    Layout,
+    /// Heading scan only (sampled pages).
+    Heading,
+}
+
+impl std::fmt::Display for TocMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}",
+            match self {
+                TocMode::Auto => "auto",
+                TocMode::Outlines => "outlines",
+                TocMode::Heuristic => "heuristic",
+                TocMode::Plain => "plain",
+                TocMode::Layout => "layout",
+                TocMode::Heading => "heading",
+            }
+        )
+    }
+}
+
+/// Extract the document TOC using the requested algorithm.
 ///
 /// Opens the PDF exactly once (page-count + outline + heuristic all share the
-/// same `PdfDocument`). `force_heuristic` skips the embedded-outline path.
-pub fn detect_toc(path: &Path, force_heuristic: bool) -> TocReport {
+/// same `PdfDocument`). Forced scan modes (`Plain`/`Layout`/`Heading`) run only
+/// that algorithm and return an empty TOC when it finds nothing — useful when
+/// the default chain is poor on a given document.
+pub fn detect_toc(path: &Path, mode: TocMode) -> TocReport {
     let doc = match PdfDocument::open(path) {
         Ok(d) => d,
         Err(e) => {
@@ -121,13 +159,36 @@ pub fn detect_toc(path: &Path, force_heuristic: bool) -> TocReport {
         return TocReport { entries: Vec::new(), total_pages: 0, source: TocSource::HeadingScan };
     }
 
-    if !force_heuristic {
-        if let Some(entries) = outlines_from_doc(&doc, total_pages) {
-            return TocReport { entries, total_pages, source: TocSource::Outlines };
+    let (entries, source) = match mode {
+        TocMode::Auto => {
+            if let Some(entries) = outlines_from_doc(&doc, total_pages) {
+                (entries, TocSource::Outlines)
+            } else {
+                heuristic_toc(&doc, path, total_pages)
+            }
         }
-    }
+        TocMode::Outlines => match outlines_from_doc(&doc, total_pages) {
+            Some(entries) => (entries, TocSource::Outlines),
+            None => (Vec::new(), TocSource::Outlines),
+        },
+        TocMode::Heuristic => heuristic_toc(&doc, path, total_pages),
+        TocMode::Plain => {
+            let cache = load_page_cache(path, total_pages);
+            toc_via_plain(&doc, path, total_pages, cache.as_ref())
+                .unwrap_or((Vec::new(), TocSource::PrintedToc))
+        }
+        TocMode::Layout => {
+            let cache = load_page_cache(path, total_pages);
+            toc_via_layout(&doc, path, total_pages, cache.as_ref())
+                .unwrap_or((Vec::new(), TocSource::PrintedToc))
+        }
+        TocMode::Heading => {
+            let cache = load_page_cache(path, total_pages);
+            let entries = heading_scan(&doc, path, total_pages, cache.as_ref());
+            (finalize_entries(entries), TocSource::HeadingScan)
+        }
+    };
 
-    let (entries, source) = heuristic_toc(&doc, path, total_pages);
     TocReport { entries, total_pages, source }
 }
 
@@ -189,57 +250,82 @@ fn flatten_outline(
 /// Try the printed-TOC heuristics; fall back to a heading scan.
 fn heuristic_toc(doc: &PdfDocument, path: &Path, total_pages: usize) -> (Vec<TocEntry>, TocSource) {
     let cache = load_page_cache(path, total_pages);
-
-    // Fast path: plain-text scan. Page text (from the on-disk index cache, or a
-    // single cheap extraction per page) is enough to find and parse a
-    // well-formed printed TOC: dot leaders, right-aligned page numbers and
-    // wrapped-title continuations all survive in plain text. Avoids the
-    // expensive layout extraction (`extract_text_lines`, which computes word
-    // geometry) for the ~20 front-matter pages — this is the difference between
-    // ~0s and ~3s on a typical textbook.
-    let plain = plain_scan(doc, path, total_pages, cache.as_ref());
-    if plain_is_acceptable(&plain) {
-        let mut entries = plain.entries;
-        let offset = resolve_pages(&mut entries, doc, path, &plain.pages, total_pages, cache.as_ref());
-        let finalized = finalize(entries, offset);
-        if finalized.len() >= 3 {
-            eprintln!(
-                "  TOC: detected printed TOC pages (plain text){} — {} entries",
-                if cache.is_some() { " from index cache" } else { "" },
-                finalized.len()
-            );
-            return (finalized, TocSource::PrintedToc);
-        }
+    if let Some(result) = toc_via_plain(doc, path, total_pages, cache.as_ref()) {
+        return result;
     }
-
-    // Robust path: layout-aware scan. Text-line geometry (right-aligned page
-    // runs, indentation, font size) stays correct where plain text misleads:
-    // multi-column TOC grids (地理), broken ToUnicode CMaps that interleave page
-    // numbers into titles (数学一年级), or mojibake page numbers (数学七年级).
-    // Only pages near a plain-text 目录/Contents marker are layout-extracted,
-    // which bounds the cost to a handful of pages instead of the whole front
-    // matter.
-    let toc = find_toc_pages(doc, total_pages, &plain.candidates, &plain.markers);
-    if !toc.pages.is_empty() {
-        let mut entries = parse_toc_pages(&toc, total_pages);
-        if entries.len() >= 3 {
-            let offset = resolve_pages(&mut entries, doc, path, &toc.pages, total_pages, cache.as_ref());
-            let finalized = finalize(entries, offset);
-            if finalized.len() >= 3 {
-                eprintln!(
-                    "  TOC: detected printed TOC on page(s) {}{} — {} entries",
-                    toc.pages.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(","),
-                    if cache.is_some() { " (index cache)" } else { "" },
-                    finalized.len()
-                );
-                return (finalized, TocSource::PrintedToc);
-            }
-        }
+    if let Some(result) = toc_via_layout(doc, path, total_pages, cache.as_ref()) {
+        return result;
     }
-
     eprintln!("  TOC: no printed TOC found; falling back to heading scan");
     let entries = heading_scan(doc, path, total_pages, cache.as_ref());
     (finalize_entries(entries), TocSource::HeadingScan)
+}
+
+/// Plain-text scan only: dot leaders, right-aligned page numbers, wrapped-title
+/// continuations, multi-column grids. Returns `None` when the result is not a
+/// solid printed TOC (so the caller can fall through to another algorithm).
+fn toc_via_plain(
+    doc: &PdfDocument,
+    path: &Path,
+    total_pages: usize,
+    cache: Option<&Vec<Option<String>>>,
+) -> Option<(Vec<TocEntry>, TocSource)> {
+    // Fast path: page text (from the on-disk index cache, or a single cheap
+    // extraction per page) is enough to find and parse a well-formed printed
+    // TOC. Avoids the expensive layout extraction (`extract_text_lines`, which
+    // computes word geometry) for the ~20 front-matter pages — the difference
+    // between ~0s and ~3s on a typical textbook.
+    let plain = plain_scan(doc, path, total_pages, cache);
+    if !plain_is_acceptable(&plain) {
+        return None;
+    }
+    let mut entries = plain.entries;
+    let offset = resolve_pages(&mut entries, doc, path, &plain.pages, total_pages, cache);
+    let finalized = finalize(entries, offset);
+    if finalized.len() < 3 {
+        return None;
+    }
+    eprintln!(
+        "  TOC: detected printed TOC pages (plain text){} — {} entries",
+        if cache.is_some() { " from index cache" } else { "" },
+        finalized.len()
+    );
+    Some((finalized, TocSource::PrintedToc))
+}
+
+/// Layout-aware scan only: word geometry (right-aligned page runs, indentation,
+/// font size). Stays correct where plain text misleads: multi-column TOC grids
+/// (地理), broken ToUnicode CMaps that interleave page numbers into titles
+/// (数学一年级), or mojibake page numbers (数学七年级). Only pages near a
+/// plain-text 目录/Contents marker are layout-extracted, which bounds the cost
+/// to a handful of pages instead of the whole front matter.
+fn toc_via_layout(
+    doc: &PdfDocument,
+    path: &Path,
+    total_pages: usize,
+    cache: Option<&Vec<Option<String>>>,
+) -> Option<(Vec<TocEntry>, TocSource)> {
+    let plain = plain_scan(doc, path, total_pages, cache);
+    let toc = find_toc_pages(doc, total_pages, &plain.candidates, &plain.markers);
+    if toc.pages.is_empty() {
+        return None;
+    }
+    let mut entries = parse_toc_pages(&toc, total_pages);
+    if entries.len() < 3 {
+        return None;
+    }
+    let offset = resolve_pages(&mut entries, doc, path, &toc.pages, total_pages, cache);
+    let finalized = finalize(entries, offset);
+    if finalized.len() < 3 {
+        return None;
+    }
+    eprintln!(
+        "  TOC: detected printed TOC on page(s) {}{} — {} entries",
+        toc.pages.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(","),
+        if cache.is_some() { " (index cache)" } else { "" },
+        finalized.len()
+    );
+    Some((finalized, TocSource::PrintedToc))
 }
 
 /// Quality gate for the fast plain-text path.
@@ -1949,6 +2035,18 @@ fn match_space_numbered_chapter(line: &str) -> Option<(String, usize)> {
     Some((format!("{} {}", num, title), 1))
 }
 
+/// Common English function words (articles, prepositions, conjunctions) that
+/// legitimately appear lowercase inside title-cased headings.
+fn is_function_word(w: &str) -> bool {
+    const WORDS: &[&str] = &[
+        "a", "an", "and", "the", "of", "in", "on", "to", "for", "with", "by", "from", "at", "as",
+        "or", "but", "per", "via", "into", "over", "under", "between", "through", "during",
+        "about", "after", "before", "without", "against", "within", "upon", "than", "then",
+        "while", "when", "where", "which", "that", "this", "these", "those",
+    ];
+    WORDS.contains(&w)
+}
+
 /// "N.N Title" → level 2, "N.N.N Title" → level 3.
 fn match_numbered_section(line: &str) -> Option<(String, usize)> {
     let chars: Vec<char> = line.chars().collect();
@@ -1977,13 +2075,18 @@ fn match_numbered_section(line: &str) -> Option<(String, usize)> {
         return None;
     }
     // Paper body text often starts with a measurement ("1.8 GHz Opteron PCs
-    // of 2GB RAM each…", "0.2 seconds per frame") — a real section heading is
-    // title-cased, so reject titles with more than two lowercase-initial words.
-    let lowercase_words: usize = title
+    // of 2GB RAM each…", "0.2 seconds per frame"). Real section headings are
+    // title-cased; their lowercase-initial words are function words ("…and the
+    // Theory of…"), while measurement lines contain lowercase content words
+    // ("each", "linked", "seconds", "frame"). Reject when more than one
+    // lowercase-initial word is not a function word.
+    let lowercase_content: usize = title
         .split_whitespace()
-        .filter(|w| w.starts_with(|c: char| c.is_ascii_lowercase()))
+        .filter(|w| {
+            w.starts_with(|c: char| c.is_ascii_lowercase()) && !is_function_word(w)
+        })
         .count();
-    if lowercase_words > 2 {
+    if lowercase_content > 1 {
         return None;
     }
     let level = (num.matches('.').count() + 1).min(3);

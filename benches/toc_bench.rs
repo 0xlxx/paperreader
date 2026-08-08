@@ -26,7 +26,7 @@ fn bench_toc(c: &mut Criterion) {
         }
         c.bench_function(name, |b| {
             b.iter(|| {
-                let report = toc::detect_toc(p, false);
+                let report = toc::detect_toc(p, toc::TocMode::Auto);
                 std::hint::black_box(report.entries.len());
             })
         });
